@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#1a2636" />
+  <title>Skirmish — Crown vs Reavers</title>
+  <link rel="stylesheet" href="./css/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- HUD: top bar overlay -->
+    <div class="hud-top">
+      <div id="turnChip" class="hud-chip blue">Crown</div>
+      <div id="phaseChip" class="hud-phase">Round 1</div>
+      <div class="hud-score"><span class="sc blue" id="vpA">0</span><span class="sc-sep">:</span><span class="sc red" id="vpB">0</span></div>
+      <div id="roundChip" class="hud-round">R1/5</div>
+      <button class="hud-btn" id="infoToggle" title="Toggle info panel">☰</button>
+    </div>
+
+    <!-- BOARD: fills the viewport -->
+    <div class="board-fill">
+      <svg id="battlefield" viewBox="0 0 36 36" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+
+    <!-- MODE HINT: one-line above action bar -->
+    <div class="mode-strip" id="modeHint">Select a unit to begin.</div>
+
+    <!-- ACTION BAR: pinned to bottom -->
+    <div class="action-bar">
+      <div class="ab-unit" id="abUnit">No unit selected</div>
+      <div class="ab-buttons" id="actionButtons"></div>
+      <button class="ab-pass" id="passBtn">Pass Round</button>
+    </div>
+
+    <!-- INFO DRAWER -->
+    <aside class="info-drawer" id="infoDrawer">
+      <div class="drawer-scroll">
+        <section class="d-section">
+          <div class="d-title">Selected Unit</div>
+          <div id="selectedUnitPanel" class="d-empty">Tap a unit</div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Battle</div>
+          <div class="d-row"><span>Force</span><span id="supplyText">0/4 vs 0/4</span></div>
+          <div id="objectiveControl" class="d-list"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Your Warband</div>
+          <div id="phaseChecklist" class="d-checklist"></div>
+          <div id="playerReserves" class="d-unit-list"></div>
+          <div id="playerBattlefield" class="d-unit-list"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Tactical Cards</div>
+          <div id="tacticalCards" class="d-list"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Enemy</div>
+          <div id="enemyBattlefield" class="d-unit-list"></div>
+          <div id="enemyReserves" class="d-unit-list"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Battle Log</div>
+          <div id="logPanel" class="d-log"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-row">
+            <button id="gridModeBtn" class="sm-btn">Grid: On</button>
+            <button id="exportBtn" class="sm-btn">Export</button>
+            <button id="importBtn" class="sm-btn">Load</button>
+            <input id="importFileInput" type="file" accept="application/json" hidden />
+            <button id="newGameBtn" class="sm-btn danger">New Game</button>
+          </div>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <div id="toastStack" class="toast-stack" aria-live="polite"></div>
+
+  <script>
+    document.getElementById("infoToggle").addEventListener("click", () => {
+      document.getElementById("infoDrawer").classList.toggle("open");
+    });
+  </script>
+  <script type="module" src="./ui/main.js"></script>
+</body>
+</html>
