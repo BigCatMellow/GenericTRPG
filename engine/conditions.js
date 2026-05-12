@@ -1,95 +1,111 @@
-const PRESSURE_LIMIT = 2;
-const PRESSURE_SEVERITY = ["shaken", "flanked", "pinned", "exposed", "guarded"];
+// v0.12 Conditions: Guarded / Pinned / Exposed / Overwhelmed (derived)
+// Max 2 conditions at once. Third condition: keep the 2 most relevant.
 
-function normalizeCondition(condition) {
-  return String(condition ?? "").trim().toLowerCase();
+const CONDITION_PRIORITY = ["guarded", "pinned", "exposed"];
+
+function normalizeCondition(c) {
+  return String(c ?? "").trim().toLowerCase();
 }
 
-export function getPressureConditions(unit) {
-  if (!unit?.status) return [];
-  if (!Array.isArray(unit.status.pressureConditions)) unit.status.pressureConditions = [];
-  return unit.status.pressureConditions;
-}
-
-export function hasCondition(unit, condition) {
+export function hasCondition(character, condition) {
   const key = normalizeCondition(condition);
-  return getPressureConditions(unit).includes(key);
+  return Array.isArray(character.conditions) && character.conditions.includes(key);
 }
 
-export function removeCondition(unit, condition) {
-  const key = normalizeCondition(condition);
-  unit.status.pressureConditions = getPressureConditions(unit).filter(c => c !== key);
+export function isOverwhelmed(character) {
+  return hasCondition(character, "pinned") && hasCondition(character, "exposed");
 }
 
-export function clearConditions(unit, conditions) {
-  for (const condition of conditions) removeCondition(unit, condition);
+function enforceConditionLimit(character) {
+  // Max 2 conditions. If 3, drop the least relevant (guarded first, then by insertion order).
+  while (character.conditions.length > 2) {
+    // Drop guarded first; otherwise drop the oldest (index 0).
+    const guardedIdx = character.conditions.indexOf("guarded");
+    if (guardedIdx !== -1) {
+      character.conditions.splice(guardedIdx, 1);
+    } else {
+      character.conditions.splice(0, 1);
+    }
+  }
 }
 
-function severityIndex(condition) {
-  const idx = PRESSURE_SEVERITY.indexOf(condition);
-  return idx === -1 ? PRESSURE_SEVERITY.length : idx;
-}
-
-export function addCondition(unit, condition) {
+export function addCondition(character, condition) {
   const key = normalizeCondition(condition);
   if (!key) return;
-  const conditions = getPressureConditions(unit);
-  if (conditions.includes(key)) return;
+  if (!Array.isArray(character.conditions)) character.conditions = [];
 
-  // Guarded is fragile. It is lost when pressure meaningfully breaks the posture.
-  if (["pinned", "flanked", "shaken"].includes(key)) {
-    removeCondition(unit, "guarded");
+  if (key === "pinned" || key === "exposed") {
+    // Applying Pinned or Exposed removes Guarded
+    removeCondition(character, "guarded");
+    // Cancel securing
+    character.securingObjectiveId = null;
   }
 
-  conditions.push(key);
-  conditions.sort((a, b) => severityIndex(a) - severityIndex(b));
-  while (conditions.length > PRESSURE_LIMIT) conditions.pop();
-  unit.status.pressureConditions = conditions;
+  if (!character.conditions.includes(key)) {
+    character.conditions.push(key);
+  }
+  enforceConditionLimit(character);
 }
 
-export function setReadiness(unit, readiness) {
-  if (!unit?.status) return;
-  unit.status.readiness = readiness;
+export function removeCondition(character, condition) {
+  const key = normalizeCondition(condition);
+  if (!Array.isArray(character.conditions)) return;
+  character.conditions = character.conditions.filter(c => c !== key);
 }
 
-export function improveReadiness(unit) {
-  const r = unit.status.readiness ?? "ready";
-  if (r === "spent") unit.status.readiness = "committed";
-  else if (r === "committed") unit.status.readiness = "ready";
+export function clearConditions(character, conditions = []) {
+  for (const c of conditions) removeCondition(character, c);
 }
 
-export function canReact(unit) {
-  if (!unit?.status) return false;
-  if (unit.status.reactionUsedThisRound) return false;
-  return unit.status.readiness === "ready" || unit.status.readiness === "committed";
+export function clearAllConditions(character) {
+  character.conditions = [];
 }
 
-export function spendReaction(unit) {
-  if (!unit?.status) return;
-  unit.status.reactionUsedThisRound = true;
-  if (unit.status.readiness === "ready") unit.status.readiness = "committed";
-  else if (unit.status.readiness === "committed") unit.status.readiness = "spent";
+// Exposed also cancels securing
+export function applyExposed(character) {
+  addCondition(character, "exposed");
+  character.securingObjectiveId = null;
 }
 
-export function completeNormalActivation(unit) {
-  if (!unit?.status) return;
-  if (unit.status.keepReadyAfterActivation) return;
-  if (!unit.status.readiness || unit.status.readiness === "ready") unit.status.readiness = "committed";
+export function applyPinned(character) {
+  addCondition(character, "pinned");
+  character.securingObjectiveId = null;
 }
 
-export function cleanupReadinessForNewRound(unit) {
-  if (!unit?.status) return;
-  const r = unit.status.readiness ?? "ready";
-  if (r === "committed") unit.status.readiness = "ready";
-  else if (r === "spent") unit.status.readiness = "committed";
-  unit.status.reactionUsedThisRound = false;
-  unit.status.keepReadyAfterActivation = false;
+export function applyGuarded(character) {
+  // Guarded is NOT applied if character is Pinned or Spent
+  if (hasCondition(character, "pinned")) return;
+  if (character.readiness === "spent") return;
+  addCondition(character, "guarded");
 }
 
-export function formatConditions(unit) {
+/** Called when Guarded bonus is used. Remove guarded. */
+export function consumeGuarded(character) {
+  removeCondition(character, "guarded");
+}
+
+/** Called when character moves, attacks, runs, becomes Pinned/Spent. */
+export function breakGuarded(character) {
+  removeCondition(character, "guarded");
+}
+
+export function canReact(character) {
+  if (!character) return false;
+  if (character.reactionUsedThisRound) return false;
+  return character.readiness === "ready" || character.readiness === "committed";
+}
+
+export function spendReaction(character) {
+  character.reactionUsedThisRound = true;
+  if (character.readiness === "ready") character.readiness = "committed";
+  else if (character.readiness === "committed") character.readiness = "spent";
+}
+
+export function formatConditions(character) {
   const parts = [];
-  if (unit?.status?.readiness) parts.push(unit.status.readiness.toUpperCase());
-  const pressure = getPressureConditions(unit);
-  if (pressure.length) parts.push(pressure.map(c => c.toUpperCase()).join("/"));
+  if (character.readiness) parts.push(character.readiness.toUpperCase());
+  if (Array.isArray(character.conditions) && character.conditions.length) {
+    parts.push(character.conditions.map(c => c[0].toUpperCase()).join(""));
+  }
   return parts.join(" · ");
 }

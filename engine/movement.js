@@ -1,293 +1,141 @@
+// v0.12 Movement
+// Move: up to move value
+// Run: move 9", become Spent, cannot also take Action
+// No coherency, no engagement, no disengage.
+// Run through Difficult/Exposing -> Exposed
+// Ending move in cover removes one condition (Pinned or Exposed)
+
 import { appendLog } from "./state.js";
-import { isUnitEligibleForActivation, beginActivation, endActivation, handleHandoff } from "./activation.js";
-import { pointInBoard, pathLength, pathBlockedForCircle, pathTravelCost, gridDistance, circleOverlapsTerrain, circleOverlapsCircle, distance } from "./geometry.js";
-import { autoArrangeModels, applyModelPlacementsAndResolveCoherency } from "./coherency.js";
-import { refreshAllSupply } from "./supply.js";
-import { getModifiedValue } from "./effects.js";
+import { pointInBoard, gridDistance } from "./geometry.js";
+import { hasCondition, removeCondition, applyExposed, breakGuarded } from "./conditions.js";
+import { applyRunReadiness } from "./readiness.js";
 
-const ENGAGEMENT_RANGE = 1;
-const RUN_BONUS = 2;
+const RUN_DISTANCE = 9;
 
-function getModel(unit, modelId) {
-  if (!unit.models[modelId]) throw new Error(`Unknown model ${modelId} in unit ${unit.id}`);
-  return unit.models[modelId];
+function characterAt(state, charId) {
+  return state.characters[charId] ?? null;
 }
 
-/* ── Engagement bookkeeping (unchanged from original) ── */
-function updateUnitEngagementStatus(state) {
-  for (const unit of Object.values(state.units)) {
-    unit.status.engaged = false;
+function isInTerrain(state, x, y, traitFn) {
+  return state.board.terrain.some(t => {
+    if (!t.rect) return false;
+    const traits = t.traits ?? (t.kind === "cover" ? ["cover"] : t.impassable ? ["blocking"] : []);
+    if (!traitFn(traits)) return false;
+    return x >= t.rect.minX && x <= t.rect.maxX && y >= t.rect.minY && y <= t.rect.maxY;
+  });
+}
+
+function isBlocking(state, x, y) {
+  return isInTerrain(state, x, y, traits => traits.includes("blocking"));
+}
+
+function isInCoverTerrain(state, x, y) {
+  return isInTerrain(state, x, y, traits => traits.includes("cover"));
+}
+
+function isInDifficultTerrain(state, x, y) {
+  return isInTerrain(state, x, y, traits => traits.includes("difficult"));
+}
+
+function isInExposingTerrain(state, x, y) {
+  return isInTerrain(state, x, y, traits => traits.includes("exposing"));
+}
+
+function getMoveDistance(state, character) {
+  // Difficult terrain: -2 inches
+  let dist = character.move;
+  if (isInDifficultTerrain(state, character.x, character.y)) {
+    dist = Math.max(0, dist - 2);
   }
-  const groundUnits = Object.values(state.units).filter(u => u.status.location === "battlefield" && u.tags.includes("Ground"));
-  for (let i = 0; i < groundUnits.length; i += 1) {
-    for (let j = i + 1; j < groundUnits.length; j += 1) {
-      const a = groundUnits[i], b = groundUnits[j];
-      if (a.owner === b.owner) continue;
-      let engaged = false;
-      for (const aModel of Object.values(a.models)) {
-        if (!aModel.alive || aModel.x == null) continue;
-        for (const bModel of Object.values(b.models)) {
-          if (!bModel.alive || bModel.x == null) continue;
-          const edge = distance(aModel, bModel) - a.base.radiusInches - b.base.radiusInches;
-          if (edge <= ENGAGEMENT_RANGE + 1e-6) { engaged = true; break; }
-        }
-        if (engaged) break;
-      }
-      if (engaged) { a.status.engaged = true; b.status.engaged = true; }
+  return dist;
+}
+
+function applyEndOfMoveEffects(state, character, fromX, fromY, toX, toY, wasRun = false) {
+  // Running through Difficult/Exposing -> Exposed
+  if (wasRun) {
+    if (isInDifficultTerrain(state, toX, toY) || isInExposingTerrain(state, toX, toY)) {
+      applyExposed(character);
+      appendLog(state, "action", `${character.name} is Exposed from running through difficult/exposing terrain.`);
+    }
+  }
+
+  // Ending move in cover removes one condition (Pinned or Exposed)
+  if (isInCoverTerrain(state, toX, toY)) {
+    if (hasCondition(character, "pinned")) {
+      removeCondition(character, "pinned");
+      appendLog(state, "action", `${character.name} reaches cover — Pinned removed.`);
+    } else if (hasCondition(character, "exposed")) {
+      removeCondition(character, "exposed");
+      appendLog(state, "action", `${character.name} reaches cover — Exposed removed.`);
     }
   }
 }
 
-export function refreshEngagement(state) { updateUnitEngagementStatus(state); }
-
-/* ── Activation gates ── */
-function validateCanAct(state, playerId, unitId) {
-  const unit = state.units[unitId];
-  if (!unit) return { ok: false, code: "UNKNOWN_UNIT", message: "Unit not found." };
-  if (unit.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "You do not control that unit." };
+export function validateMove(state, playerId, charId, destination) {
+  const ch = characterAt(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
   if (state.phase !== "battle") return { ok: false, code: "WRONG_PHASE", message: "Battle phase only." };
-  // If no activation in progress, require eligibility to start one
-  if (!state.activatingUnitId) {
-    if (!isUnitEligibleForActivation(state, unitId)) return { ok: false, code: "UNIT_NOT_ELIGIBLE", message: "Unit is not eligible to activate." };
-    return { ok: true, unit, beginningActivation: true };
-  }
-  if (state.activatingUnitId !== unitId) return { ok: false, code: "WRONG_UNIT", message: "Another unit is mid-activation." };
-  return { ok: true, unit, beginningActivation: false };
-}
+  if (ch.movementUsed) return { ok: false, code: "MOVE_USED", message: "Movement already used this activation." };
+  if (ch.x == null) return { ok: false, code: "NOT_PLACED", message: "Character not on battlefield." };
+  if (!destination) return { ok: false, code: "NO_DEST", message: "No destination." };
 
-function ensureActivationStarted(state, unitId, beginningActivation) {
-  if (beginningActivation) beginActivation(state, unitId);
-}
+  const maxDist = getMoveDistance(state, ch);
+  const dist = gridDistance({ x: ch.x, y: ch.y }, destination);
+  if (dist > maxDist + 1e-6) return { ok: false, code: "TOO_FAR", message: `Can only move ${maxDist}".` };
 
-function overlappingModelsAtPoint(state, unit, point, ignoreIds = new Set()) {
-  for (const otherUnit of Object.values(state.units)) {
-    for (const otherModel of Object.values(otherUnit.models)) {
-      if (!otherModel.alive || otherModel.x == null || ignoreIds.has(otherModel.id)) continue;
-      if (circleOverlapsCircle(point, unit.base.radiusInches, { x: otherModel.x, y: otherModel.y }, otherUnit.base.radiusInches)) return otherModel.id;
-    }
-  }
-  return null;
-}
+  if (!pointInBoard(destination, state.board, 0)) return { ok: false, code: "OFF_BOARD", message: "Destination off board." };
+  if (isBlocking(state, destination.x, destination.y)) return { ok: false, code: "BLOCKED", message: "Destination is blocked terrain." };
 
-function pointWithinEnemyGroundEngagement(state, unit, point) {
-  for (const otherUnit of Object.values(state.units)) {
-    if (otherUnit.owner === unit.owner || !otherUnit.tags.includes("Ground")) continue;
-    for (const otherModel of Object.values(otherUnit.models)) {
-      if (!otherModel.alive || otherModel.x == null) continue;
-      const edge = distance(point, otherModel) - unit.base.radiusInches - otherUnit.base.radiusInches;
-      if (edge < ENGAGEMENT_RANGE - 1e-6) return true;
-    }
-  }
-  return false;
-}
-
-function getEngagedEnemies(state, unit) {
-  const enemies = new Set();
-  for (const otherUnit of Object.values(state.units)) {
-    if (otherUnit.owner === unit.owner) continue;
-    let engaged = false;
-    for (const m of Object.values(unit.models)) {
-      if (!m.alive || m.x == null) continue;
-      for (const om of Object.values(otherUnit.models)) {
-        if (!om.alive || om.x == null) continue;
-        const edge = distance(m, om) - unit.base.radiusInches - otherUnit.base.radiusInches;
-        if (edge <= ENGAGEMENT_RANGE + 1e-6) { engaged = true; break; }
-      }
-      if (engaged) break;
-    }
-    if (engaged) enemies.add(otherUnit.id);
-  }
-  return [...enemies].map(id => state.units[id]);
-}
-
-function getMovementCost(state, path) {
-  if (state.rules?.gridMode) return gridDistance(path[0], path[path.length - 1]);
-  return pathTravelCost(path, state.board.terrain);
-}
-
-/* ── HOLD: spend the activation doing nothing ── */
-export function validateHold(state, playerId, unitId) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  if (v.unit.status.location !== "battlefield") return { ok: false, code: "NOT_ON_BATTLEFIELD", message: "Only battlefield units can Hold." };
   return { ok: true };
 }
 
-export function resolveHold(state, playerId, unitId) {
-  const v = validateCanAct(state, playerId, unitId);
+export function resolveMove(state, playerId, charId, destination) {
+  const v = validateMove(state, playerId, charId, destination);
   if (!v.ok) return v;
-  if (v.unit.status.location !== "battlefield") return { ok: false, code: "NOT_ON_BATTLEFIELD", message: "Only battlefield units can Hold." };
-  ensureActivationStarted(state, unitId, v.beginningActivation);
-  const unit = state.units[unitId];
-  unit.status.stationary = true;
-  appendLog(state, "action", `${unit.name} holds position.`);
-  endActivation(state);
-  const handoff = handleHandoff(state);
-  return { ok: true, state, events: [{ type: "unit_held", payload: { unitId } }], roundComplete: handoff.roundComplete };
+  const ch = state.characters[charId];
+  const fromX = ch.x, fromY = ch.y;
+  ch.x = destination.x;
+  ch.y = destination.y;
+  ch.movementUsed = true;
+  // Moving breaks Guarded
+  breakGuarded(ch);
+  applyEndOfMoveEffects(state, ch, fromX, fromY, destination.x, destination.y, false);
+  appendLog(state, "action", `${ch.name} moves to (${destination.x.toFixed(1)}, ${destination.y.toFixed(1)}).`);
+  return { ok: true, state, events: [{ type: "character_moved", payload: { charId } }] };
 }
 
-/* ── MOVE: consumes movement slot, leaves action available ── */
-export function validateMove(state, playerId, unitId, leadingModelId, path, modelPlacements = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const unit = v.unit;
-  if (unit.status.location !== "battlefield") return { ok: false, code: "NOT_ON_BATTLEFIELD", message: "Unit is not on the battlefield." };
-  if (unit.status.movementUsed) return { ok: false, code: "MOVE_USED", message: "This unit has already moved this activation." };
-  if (unit.status.engaged) return { ok: false, code: "UNIT_ENGAGED", message: "Engaged units cannot make a normal Move; Disengage instead." };
-  if (!path || path.length < 2) return { ok: false, code: "NO_PATH", message: "Move requires a path." };
-  const leader = getModel(unit, leadingModelId);
-  if (leader.x == null) return { ok: false, code: "INVALID_LEADER", message: "Leading model must be on the battlefield." };
-  const start = path[0];
-  if (Math.abs(start.x - leader.x) > 0.01 || Math.abs(start.y - leader.y) > 0.01) return { ok: false, code: "BAD_PATH_START", message: "Path must begin at the leader's current position." };
-  const modifiedSpeed = getModifiedValue(state, { timing: "movement_move", unitId: unit.id, key: "unit.speed", baseValue: unit.speed }).value;
-  const travelCost = getMovementCost(state, path);
-  if (travelCost - modifiedSpeed > 1e-6) return { ok: false, code: "TOO_FAR", message: `${unit.name} can only move ${modifiedSpeed}".` };
-  const ignore = new Set(unit.modelIds);
-  if (pathBlockedForCircle(path, unit.base.radiusInches, state, ignore)) return { ok: false, code: "PATH_BLOCKED", message: "Path is blocked." };
-  const end = path[path.length - 1];
-  if (!pointInBoard(end, state.board, unit.base.radiusInches)) return { ok: false, code: "OFF_BOARD", message: "Leading model must end fully on the battlefield." };
-  if (circleOverlapsTerrain(end, unit.base.radiusInches, state.board.terrain)) return { ok: false, code: "TERRAIN_OVERLAP", message: "Cannot end on impassable terrain." };
-  if (overlappingModelsAtPoint(state, unit, end, ignore)) return { ok: false, code: "BASE_OVERLAP", message: "Would overlap another base." };
-  if (pointWithinEnemyGroundEngagement(state, unit, end)) return { ok: false, code: "ENDS_ENGAGED", message: "Move cannot end within engagement range of an enemy." };
-  const placements = modelPlacements ?? autoArrangeModels(state, unitId, end);
-  return { ok: true, derived: { placements, end } };
+export function validateRun(state, playerId, charId, destination) {
+  const ch = characterAt(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+  if (state.phase !== "battle") return { ok: false, code: "WRONG_PHASE", message: "Battle phase only." };
+  if (ch.movementUsed) return { ok: false, code: "MOVE_USED", message: "Movement already used." };
+  if (ch.actionUsed) return { ok: false, code: "ACTION_USED", message: "Action already used; cannot run." };
+  if (ch.x == null) return { ok: false, code: "NOT_PLACED", message: "Character not on battlefield." };
+  if (hasCondition(ch, "pinned")) return { ok: false, code: "PINNED", message: "Pinned characters cannot Run." };
+  if (!destination) return { ok: false, code: "NO_DEST", message: "No destination." };
+
+  const dist = gridDistance({ x: ch.x, y: ch.y }, destination);
+  if (dist > RUN_DISTANCE + 1e-6) return { ok: false, code: "TOO_FAR", message: `Can only run ${RUN_DISTANCE}".` };
+  if (!pointInBoard(destination, state.board, 0)) return { ok: false, code: "OFF_BOARD", message: "Destination off board." };
+  if (isBlocking(state, destination.x, destination.y)) return { ok: false, code: "BLOCKED", message: "Destination is blocked terrain." };
+
+  return { ok: true };
 }
 
-export function resolveMove(state, playerId, unitId, leadingModelId, path, modelPlacements = null) {
-  const v = validateCanAct(state, playerId, unitId);
+export function resolveRun(state, playerId, charId, destination) {
+  const v = validateRun(state, playerId, charId, destination);
   if (!v.ok) return v;
-  const validation = validateMove(state, playerId, unitId, leadingModelId, path, modelPlacements);
-  if (!validation.ok) return validation;
-  ensureActivationStarted(state, unitId, v.beginningActivation);
-  const unit = state.units[unitId];
-  unit.leadingModelId = leadingModelId;
-  const leader = unit.models[leadingModelId];
-  leader.x = validation.derived.end.x;
-  leader.y = validation.derived.end.y;
-  const coherency = applyModelPlacementsAndResolveCoherency(state, unitId, validation.derived.placements);
-  unit.status.stationary = false;
-  unit.status.movementUsed = true;
-  refreshEngagement(state);
-  refreshAllSupply(state);
-  const removedText = coherency.removedModelIds.length ? ` ${coherency.removedModelIds.length} model(s) lost from coherency.` : "";
-  const coherencyText = coherency.outOfCoherency ? " Unit is out of coherency." : "";
-  appendLog(state, "action", `${unit.name} moves ${pathLength(path).toFixed(1)}".${removedText}${coherencyText}`);
-  return { ok: true, state, events: [{ type: "unit_moved", payload: { unitId } }] };
-}
-
-/* ── RUN: consumes movement AND action — unit ends activation ── */
-export function validateRun(state, playerId, unitId, leadingModelId, path, modelPlacements = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const unit = v.unit;
-  if (unit.status.location !== "battlefield") return { ok: false, code: "NOT_ON_BATTLEFIELD", message: "Unit is not on the battlefield." };
-  if (unit.status.movementUsed) return { ok: false, code: "MOVE_USED", message: "This unit has already moved this activation." };
-  if (unit.status.engaged) return { ok: false, code: "UNIT_ENGAGED", message: "Engaged units cannot Run." };
-  if (!path || path.length < 2) return { ok: false, code: "NO_PATH", message: "Run requires a path." };
-  const leader = unit.models[leadingModelId];
-  if (!leader || leader.x == null) return { ok: false, code: "INVALID_LEADER", message: "Leading model must be on the battlefield." };
-  const start = path[0];
-  if (Math.abs(start.x - leader.x) > 0.01 || Math.abs(start.y - leader.y) > 0.01) return { ok: false, code: "BAD_PATH_START", message: "Path must begin at the leader's current position." };
-  const maxDistance = unit.speed + RUN_BONUS;
-  const travelCost = state.rules?.gridMode ? gridDistance(path[0], path[path.length - 1]) : pathTravelCost(path, state.board.terrain);
-  if (travelCost - maxDistance > 1e-6) return { ok: false, code: "TOO_FAR", message: `${unit.name} can only Run ${maxDistance}".` };
-  const ignore = new Set(unit.modelIds);
-  if (pathBlockedForCircle(path, unit.base.radiusInches, state, ignore)) return { ok: false, code: "PATH_BLOCKED", message: "Path is blocked." };
-  const end = path[path.length - 1];
-  if (!pointInBoard(end, state.board, unit.base.radiusInches)) return { ok: false, code: "OFF_BOARD", message: "Leading model must end on the battlefield." };
-  if (circleOverlapsTerrain(end, unit.base.radiusInches, state.board.terrain)) return { ok: false, code: "TERRAIN_OVERLAP", message: "Cannot end on impassable terrain." };
-  if (overlappingModelsAtPoint(state, unit, end, ignore)) return { ok: false, code: "BASE_OVERLAP", message: "Would overlap another base." };
-  const placements = modelPlacements ?? autoArrangeModels(state, unitId, end);
-  return { ok: true, derived: { end, placements, runDistance: pathLength(path), travelCost, maxDistance } };
-}
-
-export function resolveRun(state, playerId, unitId, leadingModelId, path, modelPlacements = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const validation = validateRun(state, playerId, unitId, leadingModelId, path, modelPlacements);
-  if (!validation.ok) return validation;
-  ensureActivationStarted(state, unitId, v.beginningActivation);
-  const unit = state.units[unitId];
-  unit.leadingModelId = leadingModelId;
-  const leader = unit.models[leadingModelId];
-  leader.x = validation.derived.end.x;
-  leader.y = validation.derived.end.y;
-  const coherency = applyModelPlacementsAndResolveCoherency(state, unitId, validation.derived.placements);
-  unit.status.stationary = false;
-  unit.status.movementUsed = true;
-  unit.status.actionUsed = true;
-  unit.status.runThisActivation = true;
-  refreshEngagement(state);
-  refreshAllSupply(state);
-  appendLog(state, "action",
-    `${unit.name} runs ${validation.derived.runDistance.toFixed(1)}" (max ${validation.derived.maxDistance}").${coherency.outOfCoherency ? " Out of coherency." : ""}`);
-  endActivation(state);
-  const handoff = handleHandoff(state);
-  return { ok: true, state, events: [{ type: "unit_ran", payload: { unitId } }], roundComplete: handoff.roundComplete };
-}
-
-/* ── DISENGAGE: spend movement to break engagement ── */
-export function validateDisengage(state, playerId, unitId, leadingModelId, path, modelPlacements = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const unit = v.unit;
-  if (unit.status.location !== "battlefield") return { ok: false, code: "NOT_ON_BATTLEFIELD", message: "Unit is not on the battlefield." };
-  if (unit.status.movementUsed) return { ok: false, code: "MOVE_USED", message: "This unit has already moved this activation." };
-  if (!unit.status.engaged) return { ok: false, code: "NOT_ENGAGED", message: "Only engaged units can Disengage." };
-  if (!path || path.length < 2) return { ok: false, code: "NO_PATH", message: "Disengage requires a path." };
-  const leader = getModel(unit, leadingModelId);
-  if (leader.x == null) return { ok: false, code: "INVALID_LEADER", message: "Leading model must be on the battlefield." };
-  const modifiedSpeed = getModifiedValue(state, { timing: "movement_disengage", unitId: unit.id, key: "unit.speed", baseValue: unit.speed }).value;
-  const travelCost = getMovementCost(state, path);
-  if (travelCost - modifiedSpeed > 1e-6) return { ok: false, code: "TOO_FAR", message: `${unit.name} can only move ${modifiedSpeed}".` };
-  const ignore = new Set(unit.modelIds);
-  if (pathBlockedForCircle(path, unit.base.radiusInches, state, ignore)) return { ok: false, code: "PATH_BLOCKED", message: "Path is blocked." };
-  const end = path[path.length - 1];
-  if (!pointInBoard(end, state.board, unit.base.radiusInches)) return { ok: false, code: "OFF_BOARD", message: "Leading model must end on the battlefield." };
-  const placements = modelPlacements ?? autoArrangeModels(state, unitId, end);
-  const engagedEnemies = getEngagedEnemies(state, unit);
-  const enemySupplyTotal = engagedEnemies.reduce((t, e) => t + e.currentSupplyValue, 0);
-  const tacticalMass = unit.currentSupplyValue > enemySupplyTotal;
-  return { ok: true, derived: { end, placements, tacticalMass, engagedEnemies } };
-}
-
-export function resolveDisengage(state, playerId, unitId, leadingModelId, path, modelPlacements = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const validation = validateDisengage(state, playerId, unitId, leadingModelId, path, modelPlacements);
-  if (!validation.ok) return validation;
-  ensureActivationStarted(state, unitId, v.beginningActivation);
-  const unit = state.units[unitId];
-  unit.leadingModelId = leadingModelId;
-  const leader = unit.models[leadingModelId];
-  leader.x = validation.derived.end.x;
-  leader.y = validation.derived.end.y;
-  const coherency = applyModelPlacementsAndResolveCoherency(state, unitId, validation.derived.placements);
-  refreshEngagement(state);
-  // If still engaged after move, leader & in-engagement models are removed
-  const stillEngaged = pointWithinEnemyGroundEngagement(state, unit, { x: leader.x, y: leader.y });
-  if (stillEngaged) {
-    leader.alive = false; leader.x = null; leader.y = null;
-    appendLog(state, "action", `${unit.name} fails to break clear; leader cut down during disengage.`);
-  }
-  for (const modelId of unit.modelIds) {
-    if (modelId === leadingModelId) continue;
-    const m = unit.models[modelId];
-    if (!m.alive || m.x == null) continue;
-    if (pointWithinEnemyGroundEngagement(state, unit, { x: m.x, y: m.y })) {
-      m.alive = false; m.x = null; m.y = null;
-      appendLog(state, "info", `${unit.name} loses a model failing to clear engagement.`);
-    }
-  }
-  // Tactical Mass: if outweighed, lose the action this activation (no shoot/charge)
-  if (!validation.derived.tacticalMass) {
-    unit.status.actionUsed = true;
-  }
-  unit.status.stationary = false;
-  unit.status.movementUsed = true;
-  refreshEngagement(state);
-  refreshAllSupply(state);
-  const massNote = validation.derived.tacticalMass ? " Tactical Mass — they may still act." : " Outweighed — cannot shoot or charge this activation.";
-  appendLog(state, "action", `${unit.name} disengages.${massNote}${coherency.outOfCoherency ? " Out of coherency." : ""}`);
-  return { ok: true, state, events: [{ type: "unit_disengaged", payload: { unitId } }] };
+  const ch = state.characters[charId];
+  const fromX = ch.x, fromY = ch.y;
+  ch.x = destination.x;
+  ch.y = destination.y;
+  ch.movementUsed = true;
+  ch.actionUsed = true;
+  ch.ranThisActivation = true;
+  applyRunReadiness(ch);
+  applyEndOfMoveEffects(state, ch, fromX, fromY, destination.x, destination.y, true);
+  appendLog(state, "action", `${ch.name} runs to (${destination.x.toFixed(1)}, ${destination.y.toFixed(1)}). Becomes ${ch.readiness}.`);
+  return { ok: true, state, events: [{ type: "character_ran", payload: { charId } }] };
 }

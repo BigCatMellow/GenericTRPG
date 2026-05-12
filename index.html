@@ -4,14 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#1a2636" />
-  <title>Skirmish — Crown vs Reavers</title>
+  <title>GenericTRPG v0.12 — Skirmish</title>
   <link rel="stylesheet" href="./css/styles.css" />
 </head>
 <body>
   <div class="app">
     <!-- HUD: top bar overlay -->
     <div class="hud-top">
-      <div id="turnChip" class="hud-chip blue">Crown</div>
+      <div id="turnChip" class="hud-chip blue">Player A</div>
       <div id="phaseChip" class="hud-phase">Round 1</div>
       <div class="hud-score"><span class="sc blue" id="vpA">0</span><span class="sc-sep">:</span><span class="sc red" id="vpB">0</span></div>
       <div id="roundChip" class="hud-round">R1/5</div>
@@ -20,15 +20,15 @@
 
     <!-- BOARD: fills the viewport -->
     <div class="board-fill">
-      <svg id="battlefield" viewBox="0 0 36 36" preserveAspectRatio="xMidYMid meet"></svg>
+      <svg id="battlefield" viewBox="0 0 24 24" preserveAspectRatio="xMidYMid meet"></svg>
     </div>
 
     <!-- MODE HINT: one-line above action bar -->
-    <div class="mode-strip" id="modeHint">Select a unit to begin.</div>
+    <div class="mode-strip" id="modeHint">Select a character to begin.</div>
 
     <!-- ACTION BAR: pinned to bottom -->
     <div class="action-bar">
-      <div class="ab-unit" id="abUnit">No unit selected</div>
+      <div class="ab-unit" id="abUnit">No character selected</div>
       <div class="ab-buttons" id="actionButtons"></div>
       <button class="ab-pass" id="passBtn">Pass Round</button>
     </div>
@@ -38,32 +38,115 @@
       <button class="drawer-close" id="drawerClose" title="Close panel" aria-label="Close panel">✕</button>
       <div class="drawer-scroll">
         <section class="d-section">
-          <div class="d-title">Selected Unit</div>
-          <div id="selectedUnitPanel" class="d-empty">Tap a unit</div>
+          <div class="d-title">Selected Character</div>
+          <div id="selectedUnitPanel" class="d-empty">Select a character</div>
         </section>
         <section class="d-section">
-          <div class="d-title">Battle</div>
-          <div class="d-row"><span>Force</span><span id="supplyText">0/4 vs 0/4</span></div>
+          <div class="d-title">Objectives</div>
           <div id="objectiveControl" class="d-list"></div>
         </section>
         <section class="d-section">
-          <div class="d-title">Your Warband</div>
+          <div class="d-title">Your Warband (A)</div>
           <div id="phaseChecklist" class="d-checklist"></div>
-          <div id="playerReserves" class="d-unit-list"></div>
           <div id="playerBattlefield" class="d-unit-list"></div>
         </section>
         <section class="d-section">
-          <div class="d-title">Tactical Cards</div>
-          <div id="tacticalCards" class="d-list"></div>
-        </section>
-        <section class="d-section">
-          <div class="d-title">Enemy</div>
+          <div class="d-title">Enemy Warband (B)</div>
           <div id="enemyBattlefield" class="d-unit-list"></div>
-          <div id="enemyReserves" class="d-unit-list"></div>
         </section>
         <section class="d-section">
           <div class="d-title">Battle Log</div>
           <div id="logPanel" class="d-log"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Rules Quick Reference</div>
+          <div class="d-qref">
+            <div class="qr-line"><strong>Activation:</strong> 1 Move + 1 Action (either order). Or Run (9", → Spent, no Action).</div>
+            <div class="qr-line"><strong>Readiness:</strong> Ready → Committed → Spent. End-of-round: Spent→Committed, Committed→Ready.</div>
+            <div class="qr-line"><strong>Conditions:</strong> Guarded · Pinned · Exposed · Overwhelmed (Pinned+Exposed combined)</div>
+            <div class="qr-line"><strong>Attacks:</strong> Quick 1 dmg · Standard 2 dmg · Heavy 3 dmg (→ Spent)</div>
+            <div class="qr-line"><strong>Dodge (4+):</strong> declared before hit roll. Quick = 5+, Heavy = 3+. Pinned or Committed +1 harder.</div>
+            <div class="qr-line"><strong>Brace (4+):</strong> declared after hit. Reduces dmg 1 (Guarded: 2). Crit: +1 extra reduction.</div>
+            <div class="qr-line"><strong>Overwhelmed:</strong> Pinned + Exposed → next successful attack deals +1 dmg, then remove Exposed.</div>
+            <div class="qr-line"><strong>Objective:</strong> Control within 3". Pinned = 0. Securing = counts as 2. Score from Round 2. 1VP/round. First to 3VP wins.</div>
+            <div class="qr-line"><strong>Recover:</strong> Remove Pinned OR Remove Exposed OR improve readiness one step.</div>
+            <div class="qr-line"><strong>Hold:</strong> Become Guarded. Remove Exposed. Readiness unchanged.</div>
+          </div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Class Reference</div>
+          <div class="cref-grid">
+
+            <details class="cref-class">
+              <summary><span class="class-dot warrior"></span>Warrior — HP 5 · Move 6"</summary>
+              <div class="cref-body">
+                <div class="cref-stats">
+                  <div class="cref-stat">HP <strong>5</strong></div>
+                  <div class="cref-stat">Move <strong>6"</strong></div>
+                  <div class="cref-stat">Melee</div>
+                </div>
+                <div class="cref-rule"><strong>Battle-Ready (Passive)</strong> — When Guarded, Brace tests are one step easier (3+ instead of 4+).</div>
+                <div class="cref-rule"><strong>Standard Strike</strong> — 2 dmg. Normal attack.</div>
+                <div class="cref-rule"><strong>Heavy Blow</strong> — 3 dmg. Dodge against it is one step easier (3+). After resolving, attacker → Spent. If target is <em>Spent/Pinned/Exposed/Overwhelmed</em> and the attack hits, attacker → Committed instead of Spent.</div>
+                <div class="cref-rule"><strong>Attack Crit (nat. 6)</strong> — Choose: +1 dmg, push target 1 inch, or become Guarded.</div>
+              </div>
+            </details>
+
+            <details class="cref-class">
+              <summary><span class="class-dot ranger"></span>Ranger — HP 4 · Move 6"</summary>
+              <div class="cref-body">
+                <div class="cref-stats">
+                  <div class="cref-stat">HP <strong>4</strong></div>
+                  <div class="cref-stat">Move <strong>6"</strong></div>
+                  <div class="cref-stat">Ranged 12"</div>
+                </div>
+                <div class="cref-rule"><strong>Standard Shot</strong> — 2 dmg. Normal ranged attack. <em>Crit: +1 dmg.</em></div>
+                <div class="cref-rule"><strong>Suppressing Shot</strong> — 1 dmg. On hit, target becomes <em>Pinned</em>. <em>Crit: Pinned cannot be removed until after target's next activation.</em></div>
+                <div class="cref-rule"><strong>Called Shot</strong> — 1 dmg. Attack roll is one step harder. On hit, target becomes <em>Exposed</em>. <em>Crit: attack deals normal (2) dmg AND target becomes Exposed.</em></div>
+              </div>
+            </details>
+
+            <details class="cref-class">
+              <summary><span class="class-dot rogue"></span>Rogue — HP 4 · Move 7"</summary>
+              <div class="cref-body">
+                <div class="cref-stats">
+                  <div class="cref-stat">HP <strong>4</strong></div>
+                  <div class="cref-stat">Move <strong>7"</strong></div>
+                  <div class="cref-stat">Melee</div>
+                </div>
+                <div class="cref-rule"><strong>Exploit Opening (Passive)</strong> — Attacks are one step easier against <em>Exposed</em> or <em>Spent</em> targets.</div>
+                <div class="cref-rule"><strong>Slip Through (Passive)</strong> — After a Quick melee attack, may move up to 3". May use before the attack only if target is Exposed or Spent. Blocked while Pinned.</div>
+                <div class="cref-rule"><strong>Backstab</strong> — Quick melee attack. If target is Exposed or Spent, deals +1 dmg. <em>Crit vs Exposed/Spent: +1 dmg. Otherwise: use Slip Through again this activation.</em></div>
+              </div>
+            </details>
+
+            <details class="cref-class">
+              <summary><span class="class-dot cleric"></span>Cleric — HP 4 · Move 6"</summary>
+              <div class="cref-body">
+                <div class="cref-stats">
+                  <div class="cref-stat">HP <strong>4</strong></div>
+                  <div class="cref-stat">Move <strong>6"</strong></div>
+                  <div class="cref-stat">Support</div>
+                </div>
+                <div class="cref-rule"><strong>Weakened Strike (Passive)</strong> — Basic attacks deal <em>1 dmg</em> instead of 2. Not a primary attacker. <em>Attack Crit: one friendly ≤3" may remove Exposed.</em></div>
+                <div class="cref-rule"><strong>Rally (Action, 6" range)</strong> — Choose a friendly character. Remove Pinned or Exposed. If Spent → Committed. If any condition was removed or readiness improved, target becomes <em>Guarded</em>. <em>Crit: removes condition + improves readiness + Guarded.</em></div>
+              </div>
+            </details>
+
+            <details class="cref-class">
+              <summary><span class="class-dot mage"></span>Mage — HP 3 · Move 6"</summary>
+              <div class="cref-body">
+                <div class="cref-stats">
+                  <div class="cref-stat">HP <strong>3</strong></div>
+                  <div class="cref-stat">Move <strong>6"</strong></div>
+                  <div class="cref-stat">Magic 8"</div>
+                </div>
+                <div class="cref-rule"><strong>Arcane Bolt</strong> — 2 dmg, 8" range. Standard magic attack. <em>Crit: +1 dmg OR target becomes Exposed.</em></div>
+                <div class="cref-rule"><strong>Disrupt (Action, 8" range)</strong> — Roll 1d6. 4+: target becomes <em>Exposed</em> + suffers 1 dmg. If target already Pinned/Exposed: succeeds on 3+ instead. If target was already Exposed: also becomes <em>Pinned</em>. After resolving, Mage → Committed. <em>Crit: target becomes Exposed + Pinned. If already Exposed/Pinned: +1 dmg.</em></div>
+              </div>
+            </details>
+
+          </div>
         </section>
         <section class="d-section">
           <div class="d-row">

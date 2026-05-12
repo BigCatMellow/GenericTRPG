@@ -1,244 +1,315 @@
+// v0.12 Combat: Dodge -> Attack roll -> Brace -> Damage
+// Attack types: Quick (1 dmg), Standard (2 dmg), Heavy (3 dmg)
+// Critical on natural 6.
+
 import { appendLog } from "./state.js";
-import { distance, pointInBoard, circleOverlapsTerrain, circleOverlapsCircle, circleOverlapsRect } from "./geometry.js";
-import { recomputeUnitCurrentSupply, refreshAllSupply } from "./supply.js";
-import { getModifiedValue, onEvent } from "./effects.js";
-import { refreshEngagement } from "./movement.js";
+import { distance } from "./geometry.js";
+import {
+  hasCondition, isOverwhelmed, applyExposed, applyPinned, applyGuarded,
+  breakGuarded, removeCondition
+} from "./conditions.js";
+import { resolveDodge, resolveBrace } from "./reactions.js";
+import { applyHeavyAttackReadiness } from "./readiness.js";
 
 const MELEE_REACH_INCHES = 1.5;
-const CHARGE_MAX_RANGE_INCHES = 8;
-const PILE_IN_DISTANCE_INCHES = 3;
-const CONSOLIDATE_DISTANCE_INCHES = 3;
 
-function getAliveModels(unit) {
-  return unit.modelIds.map(id => unit.models[id]).filter(m => m.alive && m.x != null);
+function characterPoint(ch) {
+  return ch.x != null && ch.y != null ? { x: ch.x, y: ch.y } : null;
 }
 
-function getLeaderPoint(unit) {
-  const leader = unit.models[unit.leadingModelId];
-  if (!leader || !leader.alive || leader.x == null) return null;
-  return { x: leader.x, y: leader.y };
-}
-
-function isPointOccupiedByOther(state, unit, point) {
-  for (const otherUnit of Object.values(state.units)) {
-    for (const m of Object.values(otherUnit.models)) {
-      if (!m.alive || m.x == null) continue;
-      if (otherUnit.id === unit.id && m.id === unit.leadingModelId) continue;
-      const r = otherUnit.base?.radiusInches ?? unit.base.radiusInches;
-      if (circleOverlapsCircle(point, unit.base.radiusInches, { x: m.x, y: m.y }, r)) return true;
-    }
-  }
-  return false;
-}
-
-function clampLeaderDestination(state, unit, dest) {
-  if (!pointInBoard(dest, state.board, unit.base.radiusInches)) return null;
-  if (circleOverlapsTerrain(dest, unit.base.radiusInches, state.board.terrain)) return null;
-  if (isPointOccupiedByOther(state, unit, dest)) return null;
-  return dest;
-}
-
-function pointToward(origin, target, maxDistance) {
-  const dx = target.x - origin.x, dy = target.y - origin.y;
-  const len = Math.hypot(dx, dy);
-  if (!len || len <= maxDistance) return { x: target.x, y: target.y };
-  return { x: origin.x + (dx / len) * maxDistance, y: origin.y + (dy / len) * maxDistance };
-}
-
-function pointTowardUntilRange(origin, target, maxDistance, keepRange) {
-  const dx = target.x - origin.x, dy = target.y - origin.y;
-  const len = Math.hypot(dx, dy);
-  if (!len) return { x: origin.x, y: origin.y };
-  const moveDistance = Math.max(0, Math.min(maxDistance, len - keepRange));
-  return { x: origin.x + (dx / len) * moveDistance, y: origin.y + (dy / len) * moveDistance };
-}
-
-function moveLeaderToward(state, unit, towardPoint, maxDistance) {
-  const leader = unit.models[unit.leadingModelId];
-  if (!leader || leader.x == null) return false;
-  const desired = pointToward({ x: leader.x, y: leader.y }, towardPoint, maxDistance);
-  const dest = clampLeaderDestination(state, unit, desired);
-  if (!dest) return false;
-  leader.x = dest.x; leader.y = dest.y;
-  return true;
-}
-
-function moveLeaderTowardMeleeRange(state, unit, towardPoint, maxDistance, keepRange = MELEE_REACH_INCHES) {
-  const leader = unit.models[unit.leadingModelId];
-  if (!leader || leader.x == null) return false;
-  const desired = pointTowardUntilRange({ x: leader.x, y: leader.y }, towardPoint, maxDistance, keepRange);
-  const dest = clampLeaderDestination(state, unit, desired);
-  if (!dest) return false;
-  leader.x = dest.x; leader.y = dest.y;
-  return true;
-}
-
-function getNearestEnemyLeaderPoint(state, unit) {
-  let best = null, bestD = Infinity;
-  const src = getLeaderPoint(unit);
-  if (!src) return null;
-  for (const o of Object.values(state.units)) {
-    if (o.owner === unit.owner || o.status.location !== "battlefield") continue;
-    const lp = getLeaderPoint(o);
-    if (!lp) continue;
-    const d = distance(src, lp);
-    if (d < bestD) { bestD = d; best = lp; }
-  }
-  return best;
-}
-
-function rollSuccesses(attempts, target, rng) {
-  if (attempts <= 0) return 0;
-  const t = Math.max(2, Math.min(6, Math.round(target)));
-  let s = 0;
-  for (let i = 0; i < attempts; i += 1) {
-    if (Math.floor(rng() * 6) + 1 >= t) s += 1;
-  }
-  return s;
-}
-
-function woundTargetForProfile(strength, toughness) {
-  if (strength >= toughness * 2) return 2;
-  if (strength > toughness) return 3;
-  if (strength === toughness) return 4;
-  if (strength * 2 <= toughness) return 6;
-  return 5;
-}
-
-function applyWeaponKeywordsToWoundTarget(weapon, targetUnit, woundTarget) {
-  let next = woundTarget;
-  if (weapon.keywords?.includes("anti_infantry") && targetUnit.tags.includes("Infantry")) next = Math.max(2, next - 1);
-  if (weapon.keywords?.includes("precise") && targetUnit.tags.includes("Light")) next = Math.max(2, next - 1);
-  return next;
-}
-
-function getBestSaveTarget(unit, armorPenetration) {
-  const armor = Math.min(6, Math.max(2, unit.defense.armorSave + armorPenetration));
-  if (unit.defense.invulnerableSave == null) return armor;
-  return Math.min(armor, unit.defense.invulnerableSave);
-}
-
-function isUnitReceivingCover(state, unit) {
-  const cover = state.board.terrain.filter(t => !t.impassable && t.kind === "cover");
-  if (!cover.length) return false;
-  return unit.modelIds.some(id => {
-    const m = unit.models[id];
-    if (!m.alive || m.x == null) return false;
-    return cover.some(t => circleOverlapsRect({ x: m.x, y: m.y }, unit.base.radiusInches, t.rect));
-  });
-}
-
-function applyDamageToUnit(unit, totalDamage) {
-  let remaining = totalDamage;
-  const ordered = unit.modelIds.map(id => unit.models[id]).filter(m => m.alive);
-  for (const m of ordered) {
-    if (remaining <= 0) break;
-    m.woundsRemaining -= remaining;
-    if (m.woundsRemaining <= 0) {
-      remaining = Math.abs(m.woundsRemaining);
-      m.alive = false; m.x = null; m.y = null; m.woundsRemaining = 0;
-    } else {
-      remaining = 0;
-    }
-  }
-  if (unit.leadingModelId && !unit.models[unit.leadingModelId].alive) {
-    const next = unit.modelIds.find(id => unit.models[id].alive);
-    unit.leadingModelId = next ?? unit.leadingModelId;
-  }
-  const removed = ordered.filter(m => !m.alive).length;
-  recomputeUnitCurrentSupply(unit);
-  return removed;
+function getOpponent(playerId) {
+  return playerId === "playerA" ? "playerB" : "playerA";
 }
 
 /**
- * Core attack resolution. declaration = { type: "ranged"|"melee", attackerId, targetId, weaponId? }
- * Returns an event object on success, or null if the declaration fizzled.
+ * Get attack difficulty for the attacker vs target.
+ * Base: 4+ (Standard), modified by:
+ *   - Attacker's Exploit Opening passive (Rogue): one step easier vs Exposed/Spent
+ *   - Target Exposed: one step easier
+ *   - Target in cover: one step harder
+ *   - Ranged target in concealing terrain from >8": one step harder
+ *   - Elevated attacker vs lower target (with cover): one step harder for attacker from below
  */
-export function resolveSingleAttack(state, declaration, rng = Math.random) {
-  const attacker = state.units[declaration.attackerId];
-  const target = state.units[declaration.targetId];
-  if (!attacker || !target) return null;
-  if (attacker.status.location !== "battlefield" || target.status.location !== "battlefield") return null;
-  const isMelee = declaration.type === "melee";
-  const weaponPool = isMelee ? attacker.meleeWeapons : attacker.rangedWeapons;
-  const weapon = weaponPool?.find(w => w.id === declaration.weaponId) ?? weaponPool?.[0] ?? null;
-  if (!weapon) {
-    appendLog(state, "combat", `${attacker.name} has no ${isMelee ? "melee" : "ranged"} weapon — attack fizzles.`);
-    return null;
-  }
-  const ap = getLeaderPoint(attacker);
-  const tp = getLeaderPoint(target);
-  if (!ap || !tp) return null;
+function getAttackDifficulty(state, attacker, target, attackDef) {
+  let diff = 4;
 
-  const range = distance(ap, tp);
-  if (isMelee) {
-    if (range > CHARGE_MAX_RANGE_INCHES + 1e-6) {
-      appendLog(state, "combat", `${attacker.name} cannot reach ${target.name} — too far for a charge.`);
-      return null;
+  // Rogue Exploit Opening: one step easier vs Exposed or Spent
+  if (attacker.classId === "rogue") {
+    if (hasCondition(target, "exposed") || target.readiness === "spent") {
+      diff -= 1;
     }
-    // Pile in toward melee range if needed
-    const currentRange = distance(ap, tp);
-    if (currentRange > MELEE_REACH_INCHES + 1e-6) {
-      const moved = moveLeaderTowardMeleeRange(state, attacker, tp, PILE_IN_DISTANCE_INCHES, MELEE_REACH_INCHES);
-      if (!moved) {
-        appendLog(state, "combat", `${attacker.name} could not pile-in. Charge fails.`);
-        return null;
-      }
-    }
-    const reached = distance(getLeaderPoint(attacker), tp) <= MELEE_REACH_INCHES + 1e-6;
-    if (!reached) {
-      appendLog(state, "combat", `${attacker.name} fails to reach ${target.name} after pile-in.`);
-      return null;
+  }
+
+  // Target Exposed: one step easier
+  if (hasCondition(target, "exposed")) {
+    diff -= 1;
+  }
+
+  // Target in cover: one step harder (ranged/magic only)
+  if (attackDef.type !== "melee") {
+    const inCover = isInCover(state, target);
+    if (inCover) diff += 1;
+  }
+
+  // Called Shot: one step harder for attacker
+  if (attackDef.oneCategoryHarder) diff += 1;
+
+  return Math.max(2, Math.min(6, diff));
+}
+
+function isInCover(state, character) {
+  if (character.x == null || character.y == null) return false;
+  return state.board.terrain.some(t => {
+    if (!t.rect) return false;
+    const traits = t.traits ?? (t.kind === "cover" ? ["cover"] : []);
+    if (!traits.includes("cover")) return false;
+    return character.x >= t.rect.minX && character.x <= t.rect.maxX &&
+           character.y >= t.rect.minY && character.y <= t.rect.maxY;
+  });
+}
+
+/**
+ * Apply damage to character. Returns actual damage dealt.
+ */
+function applyDamage(character, amount) {
+  const actual = Math.min(character.health, Math.max(0, amount));
+  character.health -= actual;
+  return actual;
+}
+
+/**
+ * Resolve Overwhelmed payoff: if both Pinned and Exposed (Overwhelmed),
+ * next successful attack deals +1 dmg, then remove Exposed.
+ */
+function checkAndApplyOverwhelmed(target) {
+  if (isOverwhelmed(target)) {
+    removeCondition(target, "exposed");
+    return 1; // +1 damage bonus
+  }
+  return 0;
+}
+
+/**
+ * Check if target is "pressured" for Heavy attack rule
+ * (Spent/Pinned/Exposed/Overwhelmed).
+ */
+function isTargetPressured(target) {
+  return target.readiness === "spent" ||
+    hasCondition(target, "pinned") ||
+    hasCondition(target, "exposed") ||
+    isOverwhelmed(target);
+}
+
+/**
+ * Main combat resolution function.
+ * declaration = {
+ *   attackerId, targetId,
+ *   attackKey,      // key in attacker.attacks (e.g. "standard", "heavy", "suppressing", "backstab")
+ *   useDodge,       // whether defender declared dodge (auto-resolved)
+ *   useBrace        // whether defender declared brace (auto-resolved)
+ * }
+ *
+ * Returns a result object with all details.
+ */
+export function resolveCombat(state, declaration, rng = Math.random) {
+  const attacker = state.characters[declaration.attackerId];
+  const target = state.characters[declaration.targetId];
+  if (!attacker || !target) return { ok: false, reason: "Character not found." };
+  if (attacker.health <= 0 || target.health <= 0) return { ok: false, reason: "Character is defeated." };
+
+  const attackDef = attacker.attacks?.[declaration.attackKey];
+  if (!attackDef) return { ok: false, reason: `Unknown attack: ${declaration.attackKey}` };
+
+  // Range check
+  const ap = characterPoint(attacker), tp = characterPoint(target);
+  if (!ap || !tp) return { ok: false, reason: "Characters not placed." };
+  const dist = distance(ap, tp);
+
+  if (attackDef.type === "melee") {
+    if (dist > MELEE_REACH_INCHES + 1e-6) {
+      return { ok: false, reason: `Target out of melee reach (${dist.toFixed(1)}" > ${MELEE_REACH_INCHES}").` };
     }
   } else {
-    const modifiedRange = getModifiedValue(state, { timing: "combat_resolve_attack", unitId: attacker.id, key: "weapon.rangeInches", baseValue: weapon.rangeInches }).value;
-    if (range > modifiedRange + 1e-6) {
-      appendLog(state, "combat", `${target.name} is out of range.`);
-      return null;
+    const range = attackDef.range ?? 8;
+    if (dist > range + 1e-6) {
+      return { ok: false, reason: `Target out of range (${dist.toFixed(1)}" > ${range}").` };
     }
   }
 
-  const aliveAttackers = getAliveModels(attacker).length;
-  if (!aliveAttackers) return null;
-
-  const attemptsPerModel = getModifiedValue(state, { timing: "combat_resolve_attack", unitId: attacker.id, key: isMelee ? "weapon.attacksPerModel" : "weapon.shotsPerModel", baseValue: isMelee ? weapon.attacksPerModel : weapon.shotsPerModel }).value;
-  const hitTargetBase = getModifiedValue(state, { timing: "combat_resolve_attack", unitId: attacker.id, key: "weapon.hitTarget", baseValue: weapon.hitTarget }).value;
-  const woundTargetBase = woundTargetForProfile(weapon.strength, target.defense.toughness);
-  const woundTarget = applyWeaponKeywordsToWoundTarget(weapon, target, woundTargetBase);
-  let saveTarget = getBestSaveTarget(target, weapon.armorPenetration);
-  const coverApplies = !isMelee && isUnitReceivingCover(state, target);
-  if (coverApplies) saveTarget = Math.max(2, saveTarget - 1);
-
-  const attempts = Math.max(0, Math.floor(aliveAttackers * attemptsPerModel));
-  const hits = rollSuccesses(attempts, hitTargetBase, rng);
-  const wounds = rollSuccesses(hits, woundTarget, rng);
-  const saved = rollSuccesses(wounds, saveTarget, rng);
-  const unsaved = Math.max(0, wounds - saved);
-  const totalDamage = unsaved * weapon.damage;
-  const casualties = applyDamageToUnit(target, totalDamage);
-
-  const targetAlive = getAliveModels(target).length > 0;
-  if (isMelee && !targetAlive) {
-    const nearest = getNearestEnemyLeaderPoint(state, attacker);
-    if (nearest) moveLeaderToward(state, attacker, nearest, CONSOLIDATE_DISTANCE_INCHES);
-  }
-
-  appendLog(state, "combat",
-    `${attacker.name} ${isMelee ? "charges" : "shoots at"} ${target.name} (${weapon.name}): ${attempts} attempts → ${hits} hits → ${wounds} wounds → ${saved} saved${coverApplies ? " (cover)" : ""}, ${casualties} cas.`);
-
-  const event = {
-    type: "combat_attack_resolved",
-    payload: {
-      mode: isMelee ? "melee" : "ranged",
-      attackerId: attacker.id,
-      targetId: target.id,
-      weaponId: weapon.id,
-      attempts, hits, wounds, saved, unsaved, totalDamage, casualties
-    }
+  const result = {
+    ok: true,
+    attackerId: attacker.id,
+    targetId: target.id,
+    attackKey: declaration.attackKey,
+    attackType: attackDef.attackType,
+    dodgeResult: null,
+    attackRoll: null,
+    hit: false,
+    braceResult: null,
+    baseDamage: 0,
+    overwhelmedBonus: 0,
+    totalDamage: 0,
+    actualDamage: 0,
+    targetDefeated: false,
+    critEffects: [],
+    log: []
   };
-  state.lastCombatReport.push(event.payload);
-  refreshEngagement(state);
-  refreshAllSupply(state);
-  onEvent(state, event);
-  return event;
+
+  // ── Dodge phase ──
+  const targetPressuredBefore = isTargetPressured(target);
+  const canDodge = !target.reactionUsedThisRound && target.readiness !== "spent" && !hasCondition(target, "pinned");
+  // AI/auto: attempt dodge if possible (for AI bot; human player declares explicitly)
+  if (declaration.targetDeclaresDodge && canDodge) {
+    const dodge = resolveDodge(target, attackDef.attackType, rng);
+    result.dodgeResult = dodge;
+    if (dodge.ok && dodge.miss) {
+      result.log.push(`${target.name} dodges! (rolled ${dodge.roll} vs ${dodge.difficulty}+)${dodge.crit ? " Critical dodge — moves " + dodge.moveDistance + '"!' : ""}`);
+      appendLog(state, "combat", result.log.join(" "));
+      return result;
+    } else if (dodge.ok) {
+      result.log.push(`${target.name} fails to dodge (rolled ${dodge.roll} vs ${dodge.difficulty}+).`);
+    }
+  }
+
+  // ── Attack roll ──
+  const attackDiff = getAttackDifficulty(state, attacker, target, attackDef);
+  const attackRoll = Math.floor(rng() * 6) + 1;
+  const attackCrit = attackRoll === 6;
+  const attackHit = attackRoll >= attackDiff;
+  result.attackRoll = { roll: attackRoll, difficulty: attackDiff, crit: attackCrit, hit: attackHit };
+  result.hit = attackHit;
+
+  if (!attackHit) {
+    result.log.push(`${attacker.name} attacks ${target.name} with ${attackDef.name} (rolled ${attackRoll} vs ${attackDiff}+) — miss!`);
+    appendLog(state, "combat", result.log.join(" "));
+    return result;
+  }
+
+  result.log.push(`${attacker.name} attacks ${target.name} with ${attackDef.name} (rolled ${attackRoll} vs ${attackDiff}+${attackCrit ? " CRIT" : ""}) — hit!`);
+
+  // ── Calculate base damage ──
+  let baseDamage = attackDef.damage ?? 0;
+
+  // Backstab: +1 dmg if target is Exposed or Spent
+  if (declaration.attackKey === "backstab") {
+    if (hasCondition(target, "exposed") || target.readiness === "spent") {
+      baseDamage += 1;
+    }
+  }
+
+  // Called Shot crit: deals normal damage instead of reduced
+  if (declaration.attackKey === "called" && attackCrit) {
+    const template = state.characters[declaration.attackerId];
+    const stdAttack = attacker.attacks?.standard;
+    if (stdAttack) baseDamage = stdAttack.damage;
+    result.critEffects.push("called_shot_crit_normal_dmg");
+  }
+
+  // ── Apply on-hit conditions (before damage) ──
+  let suppressingCrit = false;
+  if (attackDef.appliesPinned) {
+    applyPinned(target);
+    result.log.push(`${target.name} is Pinned.`);
+    if (attackCrit) {
+      suppressingCrit = true;
+      result.critEffects.push("suppressing_crit_locked_pinned");
+      result.log.push("Suppressing Shot crit — Pinned cannot be removed until after next activation.");
+    }
+  }
+  if (attackDef.appliesExposed) {
+    applyExposed(target);
+    result.log.push(`${target.name} is Exposed.`);
+  }
+
+  // ── Overwhelmed check (must be BEFORE brace, triggered by hit) ──
+  const overwhelmedBonus = checkAndApplyOverwhelmed(target);
+  if (overwhelmedBonus > 0) {
+    result.log.push(`${target.name} was Overwhelmed! +1 dmg, Exposed removed.`);
+  }
+  result.overwhelmedBonus = overwhelmedBonus;
+
+  let totalDamage = baseDamage + overwhelmedBonus;
+
+  // ── Class crit effects on attack ──
+  if (attackCrit && !declaration.attackKey.startsWith("suppressing") && !declaration.attackKey.startsWith("called")) {
+    if (attacker.classId === "warrior") {
+      // Choose: +1 dmg, push 1", or become Guarded
+      // Auto: +1 dmg if target has health, else Guarded
+      if (target.health > 1) {
+        totalDamage += 1;
+        result.critEffects.push("warrior_crit_plus1dmg");
+        result.log.push("Warrior crit: +1 dmg!");
+      } else {
+        applyGuarded(attacker);
+        result.critEffects.push("warrior_crit_guarded");
+        result.log.push("Warrior crit: Warrior becomes Guarded!");
+      }
+    } else if (attacker.classId === "ranger" && declaration.attackKey === "standard") {
+      totalDamage += 1;
+      result.critEffects.push("ranger_crit_plus1dmg");
+      result.log.push("Ranger Standard Shot crit: +1 dmg!");
+    } else if (attacker.classId === "rogue") {
+      if (hasCondition(target, "exposed") || target.readiness === "spent") {
+        totalDamage += 1;
+        result.critEffects.push("rogue_crit_plus1dmg");
+        result.log.push("Rogue crit vs Exposed/Spent: +1 dmg!");
+      } else {
+        result.critEffects.push("rogue_crit_slip_through");
+        result.log.push("Rogue crit: Extra Slip Through use!");
+      }
+    } else if (attacker.classId === "cleric") {
+      result.critEffects.push("cleric_crit_friendly_remove_exposed");
+      result.log.push("Cleric crit: One friendly within 3\" may remove Exposed.");
+    } else if (attacker.classId === "mage" && attackDef.type === "magic") {
+      // +1 dmg OR target becomes Exposed (auto: +1 dmg)
+      totalDamage += 1;
+      result.critEffects.push("mage_crit_plus1dmg");
+      result.log.push("Mage magic crit: +1 dmg!");
+    }
+  }
+
+  result.baseDamage = baseDamage;
+
+  // ── Brace phase ──
+  const canBrace = !target.reactionUsedThisRound && target.readiness !== "spent";
+  if (declaration.targetDeclaresBrace && canBrace) {
+    const brace = resolveBrace(target, rng);
+    result.braceResult = brace;
+    if (brace.ok && brace.success) {
+      totalDamage = Math.max(0, totalDamage - brace.damageReduced);
+      result.log.push(`${target.name} braces! (rolled ${brace.roll} vs ${brace.difficulty}+${brace.crit ? " CRIT" : ""}) — reduces dmg by ${brace.damageReduced}.`);
+    } else if (brace.ok) {
+      result.log.push(`${target.name} fails to brace (rolled ${brace.roll} vs ${brace.difficulty}+).`);
+    }
+  }
+
+  result.totalDamage = totalDamage;
+
+  // ── Apply damage ──
+  const actualDamage = applyDamage(target, totalDamage);
+  result.actualDamage = actualDamage;
+
+  // Break securing if character suffers damage
+  if (actualDamage > 0) {
+    target.securingObjectiveId = null;
+  }
+
+  result.targetDefeated = target.health <= 0;
+  result.log.push(`${target.name} suffers ${actualDamage} dmg (${target.health}/${target.maxHealth} remaining).${result.targetDefeated ? " DEFEATED!" : ""}`);
+
+  // ── Heavy attack readiness ──
+  if (attackDef.attackType === "heavy") {
+    const pressuredHit = targetPressuredBefore && attackHit;
+    applyHeavyAttackReadiness(attacker, pressuredHit);
+    result.log.push(`${attacker.name} becomes ${attacker.readiness} after Heavy attack.`);
+  }
+
+  // Break Guarded when attacker attacks
+  breakGuarded(attacker);
+
+  appendLog(state, "combat", result.log.join(" "));
+  return result;
 }
+
+// Export helper used by other modules
+export { isInCover };

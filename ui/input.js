@@ -1,52 +1,40 @@
-import { autoArrangeModels } from "../engine/coherency.js";
+// v0.12 Input handlers
 
 export function bindInputHandlers(store, controller) {
-  document.getElementById("gridModeBtn").addEventListener("click", controller.onToggleGridMode);
+  document.getElementById("gridModeBtn")?.addEventListener("click", controller.onToggleGridMode);
   document.getElementById("exportBtn")?.addEventListener("click", controller.onExportSave);
   document.getElementById("importBtn")?.addEventListener("click", controller.onImportSave);
   document.getElementById("importFileInput")?.addEventListener("change", controller.onImportFileSelected);
-  document.getElementById("newGameBtn").addEventListener("click", controller.onNewGame);
-  document.getElementById("passBtn").addEventListener("click", controller.onPass);
+  document.getElementById("newGameBtn")?.addEventListener("click", controller.onNewGame);
+  document.getElementById("passBtn")?.addEventListener("click", controller.onPass);
 }
 
-export function beginMoveInteraction(state, uiState, unitId) {
-  const unit = state.units[unitId];
-  const leader = unit.models[unit.leadingModelId];
+export function beginMoveInteraction(state, uiState, charId) {
+  const ch = state.characters[charId];
+  if (!ch || ch.x == null) return;
   uiState.mode = "move";
-  uiState.previewPath = { path: [{ x: leader.x, y: leader.y }, { x: leader.x, y: leader.y }] };
-  uiState.previewUnit = { unitId, leader: { x: leader.x, y: leader.y }, placements: autoArrangeModels(state, unitId, leader) };
+  uiState.previewPath = { path: [{ x: ch.x, y: ch.y }, { x: ch.x, y: ch.y }] };
+  uiState.previewUnit = { charId, dest: { x: ch.x, y: ch.y } };
 }
 
-export function beginDeployInteraction(state, uiState, unitId) {
-  uiState.mode = "deploy";
-  uiState.previewPath = null;
-  uiState.previewUnit = null;
-}
-
-export function beginRunInteraction(state, uiState, unitId) {
-  const unit = state.units[unitId];
-  const leader = unit.models[unit.leadingModelId];
+export function beginRunInteraction(state, uiState, charId) {
+  const ch = state.characters[charId];
+  if (!ch || ch.x == null) return;
   uiState.mode = "run";
-  uiState.previewPath = { path: [{ x: leader.x, y: leader.y }, { x: leader.x, y: leader.y }] };
-  uiState.previewUnit = { unitId, leader: { x: leader.x, y: leader.y }, placements: autoArrangeModels(state, unitId, leader) };
+  uiState.previewPath = { path: [{ x: ch.x, y: ch.y }, { x: ch.x, y: ch.y }] };
+  uiState.previewUnit = { charId, dest: { x: ch.x, y: ch.y } };
 }
 
-export function beginDisengageInteraction(state, uiState, unitId) {
-  const unit = state.units[unitId];
-  const leader = unit.models[unit.leadingModelId];
-  uiState.mode = "disengage";
-  uiState.previewPath = { path: [{ x: leader.x, y: leader.y }, { x: leader.x, y: leader.y }] };
-  uiState.previewUnit = { unitId, leader: { x: leader.x, y: leader.y }, placements: autoArrangeModels(state, unitId, leader) };
-}
-
-export function beginDeclareRangedInteraction(uiState) {
-  uiState.mode = "declare_ranged";
+export function beginAttackInteraction(uiState, charId, attackKey) {
+  uiState.mode = "attack";
+  uiState.pendingAttackKey = attackKey;
   uiState.previewPath = null;
   uiState.previewUnit = null;
 }
 
-export function beginDeclareChargeInteraction(uiState) {
-  uiState.mode = "declare_charge";
+export function beginClassAbilityInteraction(uiState, charId, abilityId) {
+  uiState.mode = "class_ability";
+  uiState.pendingAbilityId = abilityId;
   uiState.previewPath = null;
   uiState.previewUnit = null;
 }
@@ -55,4 +43,6 @@ export function cancelCurrentInteraction(uiState) {
   uiState.mode = null;
   uiState.previewPath = null;
   uiState.previewUnit = null;
+  uiState.pendingAttackKey = null;
+  uiState.pendingAbilityId = null;
 }

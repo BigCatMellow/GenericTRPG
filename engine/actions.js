@@ -1,176 +1,223 @@
+// v0.12 Actions: Hold, Recover, Secure Objective, Attack, Class Ability
+
 import { appendLog } from "./state.js";
-import { isUnitEligibleForActivation, beginActivation, endActivation, handleHandoff } from "./activation.js";
 import { distance } from "./geometry.js";
-import { getModifiedValue } from "./effects.js";
-import { resolveSingleAttack } from "./combat.js";
+import {
+  hasCondition, applyGuarded, removeCondition, breakGuarded
+} from "./conditions.js";
+import { improveReadiness } from "./readiness.js";
+import { resolveCombat } from "./combat.js";
+import { resolveRally, resolveDisrupt, resolveSlipThrough } from "./classes.js";
+import { OBJECTIVE_CONTROL_RANGE } from "./objectives.js";
 
-const CHARGE_DECLARE_RANGE = 8;
-
-function getOpponent(playerId) {
-  return playerId === "playerA" ? "playerB" : "playerA";
+function getCharacter(state, charId) {
+  return state.characters[charId] ?? null;
 }
 
-function leaderPoint(unit) {
-  const m = unit.models[unit.leadingModelId];
-  if (!m || m.x == null) return null;
-  return { x: m.x, y: m.y };
-}
+function getOpponent(pid) { return pid === "playerA" ? "playerB" : "playerA"; }
 
-function validateCanAct(state, playerId, unitId) {
-  const unit = state.units[unitId];
-  if (!unit) return { ok: false, code: "UNKNOWN_UNIT", message: "Unit not found." };
-  if (unit.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "You do not control that unit." };
-  if (state.phase !== "battle") return { ok: false, code: "WRONG_PHASE", message: "Battle phase only." };
-  if (unit.status.location !== "battlefield") return { ok: false, code: "NOT_ON_BATTLEFIELD", message: "Only battlefield units can act." };
-  if (!state.activatingUnitId) {
-    if (!isUnitEligibleForActivation(state, unitId)) return { ok: false, code: "UNIT_NOT_ELIGIBLE", message: "Unit is not eligible to activate." };
-    return { ok: true, unit, beginningActivation: true };
+function isNearObjective(state, character) {
+  if (character.x == null) return null;
+  for (const obj of state.board.objectives) {
+    const d = distance({ x: character.x, y: character.y }, { x: obj.x, y: obj.y });
+    if (d <= OBJECTIVE_CONTROL_RANGE + 1e-6) return obj;
   }
-  if (state.activatingUnitId !== unitId) return { ok: false, code: "WRONG_UNIT", message: "Another unit is mid-activation." };
-  if (unit.status.actionUsed) return { ok: false, code: "ACTION_USED", message: "This unit has already taken its action." };
-  return { ok: true, unit, beginningActivation: false };
+  return null;
 }
 
-function ensureActivationStarted(state, unitId, beginningActivation) {
-  if (beginningActivation) beginActivation(state, unitId);
+/* ── HOLD ── */
+export function resolveHold(state, playerId, charId) {
+  const ch = getCharacter(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+  if (ch.activatedThisRound) return { ok: false, code: "ALREADY_ACTIVATED", message: "Character already activated." };
+
+  // Hold: become Guarded; remove Exposed
+  applyGuarded(ch);
+  if (hasCondition(ch, "exposed")) removeCondition(ch, "exposed");
+  ch.activatedThisRound = true;
+  // Hold: readiness unchanged
+  appendLog(state, "action", `${ch.name} holds — becomes Guarded, Exposed removed.`);
+  return { ok: true, state, events: [{ type: "character_held", payload: { charId } }] };
 }
 
-function findNearestEnemyInRangedReach(state, unit) {
-  const primary = unit.rangedWeapons?.[0];
-  if (!primary) return null;
-  const lp = leaderPoint(unit);
-  if (!lp) return null;
-  const enemies = state.players[getOpponent(unit.owner)].battlefieldUnitIds
-    .map(id => state.units[id])
-    .filter(e => e.status.location === "battlefield")
-    .map(e => {
-      const ep = leaderPoint(e);
-      return ep ? { e, d: distance(lp, ep) } : null;
-    })
-    .filter(Boolean)
-    .filter(x => x.d <= primary.rangeInches + 1e-6)
-    .sort((a, b) => a.d - b.d);
-  return enemies[0]?.e ?? null;
-}
+/* ── RECOVER ── */
+export function resolveRecover(state, playerId, charId) {
+  const ch = getCharacter(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+  if (ch.actionUsed) return { ok: false, code: "ACTION_USED", message: "Action already used." };
 
-function findNearestEnemyForCharge(state, unit) {
-  const lp = leaderPoint(unit);
-  if (!lp) return null;
-  const enemies = state.players[getOpponent(unit.owner)].battlefieldUnitIds
-    .map(id => state.units[id])
-    .filter(e => e.status.location === "battlefield")
-    .map(e => {
-      const ep = leaderPoint(e);
-      return ep ? { e, d: distance(lp, ep) } : null;
-    })
-    .filter(Boolean)
-    .filter(x => x.d <= CHARGE_DECLARE_RANGE + 1e-6)
-    .sort((a, b) => a.d - b.d);
-  return enemies[0]?.e ?? null;
-}
+  const nearObj = isNearObjective(state, ch);
+  const prevReadiness = ch.readiness;
 
-/* ── RANGED ATTACK ── */
-export function validateRangedAttack(state, playerId, unitId, targetId = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const unit = v.unit;
-  if (!unit.rangedWeapons?.length) return { ok: false, code: "NO_RANGED", message: "Unit has no ranged weapon." };
-  if (unit.status.runThisActivation) return { ok: false, code: "JUST_RAN", message: "A unit that ran cannot shoot." };
-  const allowed = getModifiedValue(state, {
-    timing: "assault_declare_ranged",
-    unitId: unit.id,
-    key: "assault.canDeclareRanged",
-    baseValue: true
-  });
-  if (!allowed.value) return { ok: false, code: "RANGED_BLOCKED", message: "This unit cannot shoot right now." };
-
-  if (targetId) {
-    const target = state.units[targetId];
-    if (!target) return { ok: false, code: "BAD_TARGET", message: "Target does not exist." };
-    if (target.owner === unit.owner) return { ok: false, code: "BAD_TARGET", message: "Cannot target a friendly unit." };
-    if (target.status.location !== "battlefield") return { ok: false, code: "BAD_TARGET", message: "Target must be on the battlefield." };
-    const lp = leaderPoint(unit), tp = leaderPoint(target);
-    const primary = unit.rangedWeapons[0];
-    if (!lp || !tp) return { ok: false, code: "BAD_TARGET", message: "Bad positions." };
-    if (distance(lp, tp) > primary.rangeInches + 1e-6) return { ok: false, code: "OUT_OF_RANGE", message: "Target is out of range." };
-    return { ok: true, derived: { targetId } };
+  // Choose one: remove Pinned, remove Exposed, or improve readiness
+  // Auto-priority: remove worst condition first, then readiness
+  let recovered = false;
+  let logMsg = "";
+  if (hasCondition(ch, "pinned")) {
+    removeCondition(ch, "pinned");
+    recovered = true;
+    logMsg = "Pinned removed.";
+  } else if (hasCondition(ch, "exposed")) {
+    removeCondition(ch, "exposed");
+    recovered = true;
+    logMsg = "Exposed removed.";
+  } else {
+    const before = ch.readiness;
+    improveReadiness(ch);
+    if (ch.readiness !== before) {
+      recovered = true;
+      logMsg = `Readiness improved: ${before} → ${ch.readiness}.`;
+    }
   }
-  const nearest = findNearestEnemyInRangedReach(state, unit);
-  if (!nearest) return { ok: false, code: "NO_TARGET", message: "No enemy in range." };
-  return { ok: true, derived: { targetId: nearest.id } };
-}
 
-export function resolveRangedAttack(state, playerId, unitId, targetId = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const validation = validateRangedAttack(state, playerId, unitId, targetId);
-  if (!validation.ok) return validation;
-  ensureActivationStarted(state, unitId, v.beginningActivation);
-  const unit = state.units[unitId];
-  const weaponId = unit.rangedWeapons[0]?.id ?? null;
-  const event = resolveSingleAttack(state, {
-    type: "ranged",
-    attackerId: unitId,
-    targetId: validation.derived.targetId,
-    weaponId
-  });
-  unit.status.actionUsed = true;
-  endActivation(state);
-  const handoff = handleHandoff(state);
-  return { ok: true, state, events: event ? [event] : [], roundComplete: handoff.roundComplete };
-}
-
-/* ── CHARGE: resolve melee immediately ── */
-export function validateCharge(state, playerId, unitId, targetId = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const unit = v.unit;
-  if (!unit.meleeWeapons?.length) return { ok: false, code: "NO_MELEE", message: "Unit has no melee weapon." };
-  if (unit.status.runThisActivation) return { ok: false, code: "JUST_RAN", message: "A unit that ran cannot charge." };
-
-  if (targetId) {
-    const target = state.units[targetId];
-    if (!target) return { ok: false, code: "BAD_TARGET", message: "Target does not exist." };
-    if (target.owner === unit.owner) return { ok: false, code: "BAD_TARGET", message: "Cannot target a friendly unit." };
-    if (target.status.location !== "battlefield") return { ok: false, code: "BAD_TARGET", message: "Target must be on the battlefield." };
-    const lp = leaderPoint(unit), tp = leaderPoint(target);
-    if (!lp || !tp) return { ok: false, code: "BAD_TARGET", message: "Bad positions." };
-    if (distance(lp, tp) > CHARGE_DECLARE_RANGE + 1e-6) return { ok: false, code: "OUT_OF_RANGE", message: `Target is outside ${CHARGE_DECLARE_RANGE}" charge range.` };
-    return { ok: true, derived: { targetId } };
+  // If within 3" of objective, may also become Guarded
+  if (nearObj) {
+    applyGuarded(ch);
+    logMsg += " Guarded (near objective).";
   }
-  const nearest = findNearestEnemyForCharge(state, unit);
-  if (!nearest) return { ok: false, code: "NO_TARGET", message: `No enemy within ${CHARGE_DECLARE_RANGE}".` };
-  return { ok: true, derived: { targetId: nearest.id } };
+
+  ch.actionUsed = true;
+  appendLog(state, "action", `${ch.name} recovers: ${logMsg || "no change."}`);
+  return { ok: true, state, events: [{ type: "character_recovered", payload: { charId } }] };
 }
 
-export function resolveCharge(state, playerId, unitId, targetId = null) {
-  const v = validateCanAct(state, playerId, unitId);
-  if (!v.ok) return v;
-  const validation = validateCharge(state, playerId, unitId, targetId);
-  if (!validation.ok) return validation;
-  ensureActivationStarted(state, unitId, v.beginningActivation);
-  const unit = state.units[unitId];
-  const weaponId = unit.meleeWeapons[0]?.id ?? null;
-  const event = resolveSingleAttack(state, {
-    type: "melee",
-    attackerId: unitId,
-    targetId: validation.derived.targetId,
-    weaponId
-  });
-  unit.status.actionUsed = true;
-  endActivation(state);
-  const handoff = handleHandoff(state);
-  return { ok: true, state, events: event ? [event] : [], roundComplete: handoff.roundComplete };
+/* ── SECURE OBJECTIVE ── */
+export function resolveSecureObjective(state, playerId, charId, rng = Math.random) {
+  const ch = getCharacter(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+  if (ch.actionUsed) return { ok: false, code: "ACTION_USED", message: "Action already used." };
+  if (hasCondition(ch, "pinned")) return { ok: false, code: "PINNED", message: "Pinned characters cannot Secure Objectives." };
+
+  const nearObj = isNearObjective(state, ch);
+  if (!nearObj) return { ok: false, code: "NOT_NEAR_OBJECTIVE", message: "Not within 3\" of an objective." };
+
+  const roll = Math.floor(rng() * 6) + 1;
+  const crit = roll === 6;
+  const success = roll >= 4;
+
+  if (success || crit) {
+    ch.securingObjectiveId = nearObj.id;
+    if (crit) {
+      applyGuarded(ch);
+      appendLog(state, "action", `${ch.name} secures ${nearObj.id} (rolled ${roll})! Crit — also Guarded!`);
+    } else {
+      appendLog(state, "action", `${ch.name} secures ${nearObj.id} (rolled ${roll}).`);
+    }
+  } else {
+    appendLog(state, "action", `${ch.name} fails to secure ${nearObj.id} (rolled ${roll}, needed 4+).`);
+  }
+
+  ch.actionUsed = true;
+  return { ok: true, success: success || crit, crit, roll, state, events: [{ type: "secure_attempted", payload: { charId, objectiveId: nearObj.id, success, crit } }] };
 }
 
-/* ── END ACTIVATION manually (e.g. moved but don't want to act) ── */
-export function endActivationManually(state, playerId) {
-  if (state.activePlayer !== playerId) return { ok: false, code: "NOT_ACTIVE_PLAYER", message: "Not your turn." };
-  if (!state.activatingUnitId) return { ok: false, code: "NO_ACTIVATION", message: "No activation in progress." };
-  const unit = state.units[state.activatingUnitId];
-  if (!unit) return { ok: false, code: "UNKNOWN_UNIT", message: "Unit not found." };
-  appendLog(state, "action", `${unit.name} ends activation.`);
-  endActivation(state);
-  const handoff = handleHandoff(state);
-  return { ok: true, state, events: [], roundComplete: handoff.roundComplete };
+/* ── ATTACK ── */
+export function resolveAttack(state, playerId, charId, targetId, attackKey, rng = Math.random) {
+  const ch = getCharacter(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Attacker not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+  if (ch.actionUsed) return { ok: false, code: "ACTION_USED", message: "Action already used." };
+  if (ch.x == null) return { ok: false, code: "NOT_PLACED", message: "Attacker not placed." };
+
+  const target = getCharacter(state, targetId);
+  if (!target) return { ok: false, code: "UNKNOWN_TARGET", message: "Target not found." };
+  if (target.owner === playerId) return { ok: false, code: "FRIENDLY_FIRE", message: "Cannot attack friendly characters." };
+  if (target.health <= 0) return { ok: false, code: "TARGET_DEFEATED", message: "Target already defeated." };
+  if (target.x == null) return { ok: false, code: "TARGET_NOT_PLACED", message: "Target not placed." };
+
+  // Check attack exists
+  const attackDef = ch.attacks?.[attackKey];
+  if (!attackDef) return { ok: false, code: "UNKNOWN_ATTACK", message: `Unknown attack: ${attackKey}` };
+
+  // Slip Through validation for Backstab / Quick melee
+  if (attackKey === "backstab") {
+    if (!hasCondition(target, "exposed") && target.readiness !== "spent") {
+      return { ok: false, code: "BACKSTAB_INVALID", message: "Backstab requires target to be Exposed or Spent." };
+    }
+  }
+
+  // Auto Dodge/Brace for AI (always attempt if possible)
+  const targetDeclaresDodge = !target.reactionUsedThisRound && target.readiness !== "spent" && !hasCondition(target, "pinned");
+  const targetDeclaresBrace = false; // brace declared after seeing if dodge failed — handled in combat
+
+  const combatResult = resolveCombat(state, {
+    attackerId: charId,
+    targetId,
+    attackKey,
+    targetDeclaresDodge,
+    targetDeclaresBrace
+  }, rng);
+
+  if (!combatResult.ok) return { ok: false, code: "COMBAT_FAILED", message: combatResult.reason };
+
+  // Mark action used and breaking guarded
+  ch.actionUsed = true;
+  breakGuarded(ch);
+
+  // Check Slip Through eligibility (Rogue, after Quick melee hit)
+  let slipThroughEligible = false;
+  if (ch.classId === "rogue" && attackDef.attackType === "quick" && attackDef.type === "melee" && combatResult.hit) {
+    if ((hasCondition(target, "exposed") || target.readiness === "spent") && !hasCondition(ch, "pinned")) {
+      slipThroughEligible = true;
+    }
+    // Rogue crit: extra slip through
+    if (combatResult.attackRoll?.crit && (!hasCondition(target, "exposed") && target.readiness !== "spent")) {
+      slipThroughEligible = true;
+    }
+  }
+
+  return {
+    ok: true,
+    state,
+    combatResult,
+    slipThroughEligible,
+    events: [{ type: "attack_resolved", payload: { attackerId: charId, targetId, attackKey, hit: combatResult.hit, damage: combatResult.actualDamage } }]
+  };
+}
+
+/* ── CLASS ABILITY ── */
+export function resolveClassAbility(state, playerId, charId, abilityId, targetId = null, rng = Math.random) {
+  const ch = getCharacter(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+  if (ch.actionUsed) return { ok: false, code: "ACTION_USED", message: "Action already used." };
+
+  if (abilityId === "rally" && ch.classId === "cleric") {
+    if (!targetId) return { ok: false, code: "NO_TARGET", message: "Rally requires a target friendly character." };
+    const result = resolveRally(state, charId, targetId, rng);
+    if (!result.ok) return { ok: false, code: "RALLY_FAILED", message: result.reason };
+    ch.actionUsed = true;
+    return { ok: true, state, abilityResult: result, events: [{ type: "rally_resolved", payload: { clericId: charId, targetId } }] };
+  }
+
+  if (abilityId === "disrupt" && ch.classId === "mage") {
+    if (!targetId) return { ok: false, code: "NO_TARGET", message: "Disrupt requires an enemy target." };
+    const result = resolveDisrupt(state, charId, targetId, rng);
+    if (!result.ok) return { ok: false, code: "DISRUPT_FAILED", message: result.reason };
+    // actionUsed set inside resolveDisrupt
+    return { ok: true, state, abilityResult: result, events: [{ type: "disrupt_resolved", payload: { mageId: charId, targetId } }] };
+  }
+
+  if (abilityId === "slip_through" && ch.classId === "rogue") {
+    if (!targetId) return { ok: false, code: "NO_TARGET", message: "Slip Through requires a destination." };
+    // targetId here is used as destination point { x, y }
+    const result = resolveSlipThrough(state, charId, targetId, rng);
+    if (!result.ok) return { ok: false, code: "SLIP_THROUGH_FAILED", message: result.reason };
+    return { ok: true, state, abilityResult: result, events: [{ type: "slip_through_resolved", payload: { rogueId: charId } }] };
+  }
+
+  return { ok: false, code: "UNKNOWN_ABILITY", message: `Unknown ability: ${abilityId}` };
+}
+
+/* ── END ACTIVATION ── */
+export function endActivationManually(state, playerId, charId) {
+  const ch = getCharacter(state, charId);
+  if (!ch) return { ok: false, code: "UNKNOWN_CHAR", message: "Character not found." };
+  if (ch.owner !== playerId) return { ok: false, code: "WRONG_OWNER", message: "Not your character." };
+
+  appendLog(state, "action", `${ch.name} ends activation.`);
+  return { ok: true, state, events: [] };
 }

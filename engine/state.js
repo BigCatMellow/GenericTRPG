@@ -1,118 +1,82 @@
-import { createUnitStateFromTemplate } from "../data/units.js";
+// v0.12 State management
+import { createCharacterState } from "../data/characters.js";
 import { getMission } from "../data/missions.js";
 import { getDeployment } from "../data/deployments.js";
 
+// 5v5 standard mirror game: one of each class per side
+const CLASS_ROSTER = ["warrior", "ranger", "rogue", "cleric", "mage"];
+
+// Starting positions for playerA (bottom) and playerB (top)
+const STARTING_POSITIONS_A = [
+  { x: 4.5, y: 20.5 },
+  { x: 8.5, y: 21.5 },
+  { x: 12.5, y: 22.5 },
+  { x: 16.5, y: 21.5 },
+  { x: 20.5, y: 20.5 }
+];
+const STARTING_POSITIONS_B = [
+  { x: 4.5, y: 3.5 },
+  { x: 8.5, y: 2.5 },
+  { x: 12.5, y: 1.5 },
+  { x: 16.5, y: 2.5 },
+  { x: 20.5, y: 3.5 }
+];
+
 function createTerrain() {
   return [
-    { id: "t1", kind: "blocker", impassable: true, rect: { minX: 11, minY: 14, maxX: 15, maxY: 18 } },
-    { id: "t2", kind: "blocker", impassable: true, rect: { minX: 21, minY: 18, maxX: 25, maxY: 22 } },
-    { id: "t3", kind: "cover", impassable: false, rect: { minX: 15, minY: 7, maxX: 20, maxY: 11 } },
-    { id: "t4", kind: "cover", impassable: false, rect: { minX: 16, minY: 24, maxX: 22, maxY: 28 } }
+    { id: "t1", kind: "blocking", impassable: true, traits: ["blocking"], rect: { minX: 10, minY: 10, maxX: 14, maxY: 14 } },
+    { id: "t2", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 3, minY: 8, maxX: 7, maxY: 11 } },
+    { id: "t3", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 17, minY: 13, maxX: 21, maxY: 16 } },
+    { id: "t4", kind: "difficult", impassable: false, traits: ["difficult"], rect: { minX: 5, minY: 14, maxX: 9, maxY: 18 } },
+    { id: "t5", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 15, minY: 6, maxX: 19, maxY: 9 } }
   ];
 }
 
-function createDefaultHand(playerId, cardIds = ["aim_carefully", "forced_march"]) {
-  return cardIds.map((cardId, index) => ({
-    instanceId: `${playerId}_card_${cardId}_${index + 1}`,
-    cardId
-  }));
-}
+export function createInitialGameState({ firstPlayerThisRound = "playerA" } = {}) {
+  const deployment = getDeployment("standard");
+  const mission = getMission("standard");
 
-/**
- * Top-level state shape:
- *   round            — 1-indexed round counter
- *   phase            — "battle" or "cleanup". The old movement/assault/combat phases are gone.
- *   activePlayer     — whose activation it is
- *   activatingUnitId — the unit currently mid-activation (null when between activations)
- *   firstPlayerThisRound — who started this round; alternates each round
- *
- * Per-unit:
- *   status.activatedThisRound  — single flag, replaces the three phase flags
- *   status.movementUsed        — within an activation, tracks whether the move slot is spent
- *   status.actionUsed          — within an activation, tracks whether the action slot is spent
- *   status.runThisActivation   — flag so post-run rules (no shoot/charge) can apply
- */
-export function createInitialGameState({
-  missionId,
-  deploymentId,
-  armyA,
-  armyB,
-  tacticalCardsA = ["aim_carefully", "forced_march"],
-  tacticalCardsB = ["aim_carefully", "forced_march"],
-  rules = { gridMode: true },
-  firstPlayerThisRound = "playerA"
-}) {
-  const mission = getMission(missionId);
-  const deployment = getDeployment(deploymentId);
-  const units = {};
-  const reserveA = [];
-  const reserveB = [];
+  const characters = {};
 
-  for (const entry of armyA) {
-    const unit = createUnitStateFromTemplate(entry.templateId, "playerA", entry.id);
-    units[unit.id] = unit;
-    reserveA.push(unit.id);
-  }
-  for (const entry of armyB) {
-    const unit = createUnitStateFromTemplate(entry.templateId, "playerB", entry.id);
-    units[unit.id] = unit;
-    reserveB.push(unit.id);
-  }
+  CLASS_ROSTER.forEach((classId, i) => {
+    const idA = `playerA_${classId}`;
+    const idB = `playerB_${classId}`;
+    const chA = createCharacterState(classId, "playerA", idA);
+    const chB = createCharacterState(classId, "playerB", idB);
+    chA.x = STARTING_POSITIONS_A[i].x;
+    chA.y = STARTING_POSITIONS_A[i].y;
+    chB.x = STARTING_POSITIONS_B[i].x;
+    chB.y = STARTING_POSITIONS_B[i].y;
+    characters[idA] = chA;
+    characters[idB] = chB;
+  });
 
   return {
     round: 1,
     phase: "battle",
-    mission,
-    deployment,
-    board: {
-      widthInches: deployment.boardWidthInches,
-      heightInches: deployment.boardHeightInches,
-      terrain: createTerrain()
-    },
-    rules: { gridMode: Boolean(rules?.gridMode) },
-    players: {
-      playerA: {
-        vp: 0,
-        reserveUnitIds: reserveA,
-        battlefieldUnitIds: [],
-        supplyPool: mission.startingSupply,
-        availableSupply: mission.startingSupply,
-        passedThisRound: false,
-        hand: createDefaultHand("playerA", tacticalCardsA),
-        discardPile: []
-      },
-      playerB: {
-        vp: 0,
-        reserveUnitIds: reserveB,
-        battlefieldUnitIds: [],
-        supplyPool: mission.startingSupply,
-        availableSupply: mission.startingSupply,
-        passedThisRound: false,
-        hand: createDefaultHand("playerB", tacticalCardsB),
-        discardPile: []
-      }
-    },
-    units,
-    effects: [],
-    lastCombatReport: [],
-    lastRoundSummary: null,
-    objectiveControl: Object.fromEntries(
-      deployment.missionMarkers.map(marker => [marker.id, {
-        objectiveId: marker.id, controller: null, playerASupply: 0, playerBSupply: 0, contested: false
-      }])
-    ),
-    winner: null,
-    firstPlayerThisRound,
     activePlayer: firstPlayerThisRound,
-    activatingUnitId: null,
+    firstPlayerThisRound,
+    activatingCharacterId: null,
+
+    characters,
+    board: {
+      widthInches: 24,
+      heightInches: 24,
+      terrain: createTerrain(),
+      objectives: deployment.missionMarkers
+    },
+
+    players: {
+      playerA: { vp: 0, characterIds: Object.keys(characters).filter(k => k.startsWith("playerA")), passedThisRound: false, hand: [], discardPile: [] },
+      playerB: { vp: 0, characterIds: Object.keys(characters).filter(k => k.startsWith("playerB")), passedThisRound: false, hand: [], discardPile: [] }
+    },
+
+    objectiveControl: {},
+    effects: [],
     log: [
-      {
-        type: "phase",
-        text: `Round 1 begins. ${firstPlayerThisRound === "playerA" ? "Crown Levy" : "Border Reavers"} have first activation.`,
-        round: 1,
-        phase: "battle"
-      }
-    ]
+      { type: "phase", text: "Round 1 begins.", round: 1, phase: "battle" }
+    ],
+    winner: null
   };
 }
 
@@ -124,18 +88,14 @@ export function appendLog(state, type, text) {
   state.log.push({ type, text, round: state.round, phase: state.phase });
 }
 
-export function getUnit(state, unitId) {
-  return state.units[unitId] ?? null;
+export function getCharacter(state, charId) {
+  return state.characters[charId] ?? null;
 }
 
-export function getPlayerUnits(state, playerId) {
-  return Object.values(state.units).filter(unit => unit.owner === playerId);
+export function getPlayerCharacters(state, playerId) {
+  return Object.values(state.characters).filter(ch => ch.owner === playerId);
 }
 
-export function getBattlefieldUnits(state, playerId) {
-  return getPlayerUnits(state, playerId).filter(unit => unit.status.location === "battlefield");
-}
-
-export function getReserveUnits(state, playerId) {
-  return getPlayerUnits(state, playerId).filter(unit => unit.status.location === "reserves");
+export function getLivingCharacters(state, playerId) {
+  return getPlayerCharacters(state, playerId).filter(ch => ch.health > 0);
 }
