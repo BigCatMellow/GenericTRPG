@@ -1,44 +1,25 @@
-import {
-  getLegalDeployDestinations,
-  getLegalMoveDestinations,
-  getLegalDisengageDestinations,
-  getLegalRunDestinations,
-  getLegalActionsForPlayer
-} from "../engine/legal_actions.js";
-import { autoArrangeModels } from "../engine/coherency.js";
+// v0.12 AI Bot
+// Priorities: scoring, stopping enemy scoring, Pinning objective holders,
+//             Rallying allies, exploiting Overwhelmed, creating Overwhelmed.
+
+import { getLegalActionsForPlayer } from "../engine/legal_actions.js";
 import { distance } from "../engine/geometry.js";
-import { getObjectiveControlSnapshot, getObjectiveControlRange } from "../engine/objectives.js";
-import { getTacticalCard } from "../data/tactical_cards.js";
+import { hasCondition, isOverwhelmed } from "../engine/conditions.js";
+import { getObjectiveControlSnapshot } from "../engine/objectives.js";
 
-/* ── Tiny helpers ── */
+const OBJECTIVE_RANGE = 3;
+
 const opp = pid => pid === "playerA" ? "playerB" : "playerA";
-const lp = u => { const m = u.models[u.leadingModelId]; return m?.alive && m.x != null ? { x: m.x, y: m.y } : null; };
-const alive = u => u.modelIds.filter(id => u.models[id].alive).length;
-const wounds = u => u.modelIds.reduce((s, id) => { const m = u.models[id]; return s + (m.alive ? (m.woundsRemaining ?? 1) : 0); }, 0);
-const onField = u => u.status.location === "battlefield";
-const inReserves = u => u.status.location === "reserves";
-const mxRange = u => Math.max(0, ...(u.rangedWeapons ?? []).map(w => w.rangeInches ?? 0));
-const hasR = u => u.rangedWeapons?.length > 0;
-const hasM = u => u.meleeWeapons?.length > 0;
-const hasROnly = u => hasR(u) && !hasM(u);
 
-function availSupply(state, pid) {
-  const pool = state.players[pid].supplyPool;
-  const used = state.players[pid].battlefieldUnitIds.reduce((t, id) => t + state.units[id].currentSupplyValue, 0);
-  return pool === Infinity ? Infinity : pool - used;
-}
+function charPoint(ch) { return ch.x != null ? { x: ch.x, y: ch.y } : null; }
+function isAlive(ch) { return ch.health > 0; }
+function onField(ch) { return ch.x != null && ch.y != null && isAlive(ch); }
 
-function bPath(u, p) { const l = u.models[u.leadingModelId]; return [{ x: l.x, y: l.y }, { x: p.x, y: p.y }]; }
-
-/* ══════════════════════════════════════════════════════════════
-   STRATEGIC ASSESSMENT — runs once per activation pick
-   ══════════════════════════════════════════════════════════════ */
+/* ── Strategic assessment ── */
 function assess(state, pid) {
   const me = state.players[pid], them = state.players[opp(pid)];
   const snap = getObjectiveControlSnapshot(state);
-  const cr = getObjectiveControlRange(state);
-  const rl = state.mission.pacing?.roundLimit ?? state.mission.roundLimit ?? 5;
-  const roundsLeft = rl - state.round;
+  const roundsLeft = 5 - state.round;
   const vpDiff = me.vp - them.vp;
 
   let posture;
@@ -47,15 +28,15 @@ function assess(state, pid) {
   else if (vpDiff > 2 || (vpDiff > 0 && roundsLeft <= 1)) posture = "defensive";
   else posture = "balanced";
 
-  const objPriorities = state.deployment.missionMarkers.map(obj => {
+  const objectives = state.board.objectives.map(obj => {
     const c = snap[obj.id];
     let priority = 0;
-    if (!c.controller && !c.contested) priority = 10;
+    if (!c || (!c.controller && !c.contested)) priority = 10;
     else if (c.contested) priority = 8;
-    else if (c.controller === opp(pid)) priority = 5;
+    else if (c.controller === opp(pid)) priority = 6;
     else {
-      const enemyNear = Object.values(state.units).some(e =>
-        e.owner !== pid && onField(e) && lp(e) && distance(lp(e), obj) <= cr + 8
+      const enemyNear = Object.values(state.characters).some(e =>
+        e.owner !== pid && onField(e) && distance(charPoint(e), obj) <= OBJECTIVE_RANGE + 5
       );
       priority = enemyNear ? 4 : 1;
     }
@@ -63,397 +44,355 @@ function assess(state, pid) {
     return { ...obj, ...c, priority };
   }).sort((a, b) => b.priority - a.priority);
 
-  return { posture, vpDiff, roundsLeft, roundLimit: rl, objPriorities, snap, cr };
+  return { posture, vpDiff, roundsLeft, objectives, snap };
 }
 
-/* ══════════════════════════════════════════════════════════════
-   POSITION SCORING — for picking move destinations
-   ══════════════════════════════════════════════════════════════ */
-function scorePosition(state, pid, unit, point, ctx) {
+/* ── Position scoring ── */
+function scorePosition(state, pid, ch, point, ctx) {
   let score = 0;
-  // Objective proximity
-  for (const obj of ctx.objPriorities) {
+  const cp = charPoint(ch);
+  for (const obj of ctx.objectives) {
     const d = distance(point, obj);
-    if (d <= ctx.cr) score += obj.priority * 3;
-    else if (d <= ctx.cr + 5) score += obj.priority * Math.max(0, (ctx.cr + 5 - d) / 5);
+    if (d <= OBJECTIVE_RANGE) score += obj.priority * 3;
+    else if (d <= OBJECTIVE_RANGE + 4) score += obj.priority * (OBJECTIVE_RANGE + 4 - d) / 4;
   }
-  // Ranged sweet-spot vs enemies
-  const enemies = Object.values(state.units).filter(u => u.owner === opp(pid) && onField(u));
-  for (const e of enemies) {
-    const ep = lp(e);
-    if (!ep) continue;
-    const d = distance(point, ep);
-    if (hasR(unit)) {
-      const mr = mxRange(unit);
-      if (mr > 0) {
-        const ideal = mr * 0.7;
-        score -= Math.abs(d - ideal) * 0.4;
-        if (d <= 1.5) score -= hasROnly(unit) ? 12 : 5;
-      }
+  // Melee chars: approach enemies
+  if (["warrior", "rogue", "cleric"].includes(ch.classId)) {
+    const enemies = Object.values(state.characters).filter(e => e.owner !== pid && onField(e));
+    for (const e of enemies) {
+      const ep = charPoint(e);
+      if (!ep) continue;
+      const d = distance(point, ep);
+      score += Math.max(0, 10 - d) * 0.4;
     }
-    if (hasM(unit) && !hasR(unit) && ctx.posture !== "defensive") {
-      score += Math.max(0, 8 - d) * 0.6;
+  }
+  // Ranger/Mage: keep distance but within range
+  if (ch.classId === "ranger") {
+    const enemies = Object.values(state.characters).filter(e => e.owner !== pid && onField(e));
+    for (const e of enemies) {
+      const ep = charPoint(e);
+      if (!ep) continue;
+      const d = distance(point, ep);
+      if (d < 2) score -= 5;
+      else if (d <= 8) score += 3;
+    }
+  }
+  if (ch.classId === "mage") {
+    const enemies = Object.values(state.characters).filter(e => e.owner !== pid && onField(e));
+    for (const e of enemies) {
+      const ep = charPoint(e);
+      if (!ep) continue;
+      const d = distance(point, ep);
+      if (d < 3) score -= 8;
+      else if (d <= 8) score += 4;
     }
   }
   // Edge penalty
   const ed = Math.min(point.x, point.y, state.board.widthInches - point.x, state.board.heightInches - point.y);
-  if (ed < 3) score -= (3 - ed) * 3;
+  if (ed < 3) score -= (3 - ed) * 2;
   return score;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   TARGET SCORING — for picking who to shoot/charge
-   ══════════════════════════════════════════════════════════════ */
-function scoreTarget(state, pid, atk, tgt, ctx) {
-  const tp = lp(tgt), ap = lp(atk);
+/* ── Target scoring ── */
+function scoreTarget(state, pid, attacker, target, ctx) {
+  const tp = charPoint(target), ap = charPoint(attacker);
   if (!tp || !ap) return -Infinity;
-  const d = distance(ap, tp);
   let s = 0;
-  // Wounded targets are easier kills
-  const w = wounds(tgt);
-  if (w <= 1) s += 18;
-  else if (w <= 2) s += 12;
-  else if (w <= 4) s += 6;
-  // Cost
-  s += tgt.currentSupplyValue * 3;
-  // Objective presence
-  for (const obj of state.deployment.missionMarkers) {
-    if (distance(tp, obj) <= ctx.cr) s += 8;
+  // Wounded targets easier to finish
+  const pct = target.health / target.maxHealth;
+  if (pct <= 0.25) s += 20;
+  else if (pct <= 0.5) s += 12;
+  else if (pct <= 0.75) s += 6;
+  // Target near objective
+  for (const obj of ctx.objectives) {
+    if (distance(tp, obj) <= OBJECTIVE_RANGE) s += 8;
   }
+  // Overwhelmed targets are high priority
+  if (isOverwhelmed(target)) s += 10;
+  // Exposed/Spent targets are easier
+  if (hasCondition(target, "exposed") || target.readiness === "spent") s += 6;
   return s;
 }
 
-function scoreRangedRange(atk, tgt) {
-  const ap = lp(atk), tp = lp(tgt);
-  if (!ap || !tp) return -Infinity;
-  const d = distance(ap, tp), mr = mxRange(atk);
-  if (mr <= 0 || d > mr + 1e-6) return -Infinity;
-  return Math.max(0, 12 - d) * 0.5;
-}
-
-function scoreChargeViability(atk, tgt) {
-  const ap = lp(atk), tp = lp(tgt);
-  if (!ap || !tp) return -Infinity;
-  const d = distance(ap, tp);
-  if (d > 8 + 1e-6) return -Infinity;
-  let s = tgt.currentSupplyValue * 2 + Math.max(0, 8 - d);
-  if (hasROnly(atk)) s -= 20;
-  if (tgt.currentSupplyValue >= atk.currentSupplyValue * 2 && alive(atk) <= 2) s -= 10;
-  return s;
-}
-
-/* ══════════════════════════════════════════════════════════════
-   ACTIVATION-ORDER SCORING — which unit should we activate now?
-   ══════════════════════════════════════════════════════════════ */
-function scoreActivationPriority(state, pid, unit, ctx) {
+/* ── Activation priority ── */
+function scoreActivationPriority(state, pid, ch, ctx) {
   let s = 0;
-  // Reserves: deploy cheap stuff early, expensive stuff late
-  if (inReserves(unit)) {
-    const cheapFirst = ctx.roundsLeft >= ctx.roundLimit - 2;
-    s += cheapFirst ? (10 - unit.currentSupplyValue) : unit.currentSupplyValue;
-    // Penalize if we can't afford it
-    if (unit.currentSupplyValue > availSupply(state, pid)) s -= 100;
-    return s;
+  const cp = charPoint(ch);
+  if (!cp) return -10;
+  // Near objectives
+  for (const obj of ctx.objectives) {
+    const d = distance(cp, obj);
+    if (d <= OBJECTIVE_RANGE + 1) s += 6;
   }
-  // Battlefield: prioritize units that can immediately threaten or score
-  const up = lp(unit);
-  if (!up) return -10;
-  // Engaged units act first to disengage or charge back
-  if (unit.status.engaged) s += 4;
-  // Units adjacent to objectives are valuable activations
-  for (const obj of ctx.objPriorities) {
-    const d = distance(up, obj);
-    if (d <= ctx.cr + 1) s += 6;
+  // Can attack an enemy
+  const enemies = Object.values(state.characters).filter(e => e.owner !== pid && onField(e));
+  for (const e of enemies) {
+    const ep = charPoint(e);
+    if (!ep) continue;
+    const d = distance(cp, ep);
+    if (d <= 2) s += 5; // melee range
+    if (d <= 8 && ["ranger", "mage"].includes(ch.classId)) s += 5; // ranged
   }
-  // Ranged units near sweet-spot — high priority to fire
-  if (hasR(unit)) {
-    const enemies = Object.values(state.units).filter(u => u.owner === opp(pid) && onField(u));
-    const inRange = enemies.some(e => {
-      const ep = lp(e);
-      return ep && distance(up, ep) <= mxRange(unit);
-    });
-    if (inRange) s += 5;
-  }
-  // Charge-ready units
-  if (hasM(unit)) {
-    const enemies = Object.values(state.units).filter(u => u.owner === opp(pid) && onField(u));
-    const closeTarget = enemies.some(e => {
-      const ep = lp(e);
-      return ep && distance(up, ep) <= 8;
-    });
-    if (closeTarget) s += 4;
-  }
-  // Hero units are valuable — save unless desperate
-  if (unit.tags.includes("Hero") && ctx.posture !== "desperate") s -= 1;
-  return s;
-}
-
-/* ══════════════════════════════════════════════════════════════
-   PICK NEXT UNIT
-   ══════════════════════════════════════════════════════════════ */
-function pickNextUnit(state, pid, ctx) {
-  const avail = availSupply(state, pid);
-  const eligible = Object.values(state.units).filter(u => {
-    if (u.owner !== pid) return false;
-    if (u.status.activatedThisRound) return false;
-    if (onField(u)) return true;
-    if (inReserves(u)) {
-      // Skip reserves we can't afford — they'd just deadlock the planner
-      return u.currentSupplyValue <= avail;
+  // Cleric with wounded/conditioned friendlies nearby: high priority
+  if (ch.classId === "cleric") {
+    const friends = Object.values(state.characters).filter(f =>
+      f.owner === pid && f.id !== ch.id && onField(f) && distance(cp, charPoint(f)) <= 6
+    );
+    for (const f of friends) {
+      if (hasCondition(f, "pinned") || hasCondition(f, "exposed") || f.readiness === "spent") s += 8;
     }
-    return false;
-  });
+  }
+  // Pinned chars need action to recover
+  if (hasCondition(ch, "pinned")) s += 4;
+  return s;
+}
+
+/* ── Pick unit to activate ── */
+function pickNextCharacter(state, pid, ctx) {
+  const eligible = Object.values(state.characters).filter(ch =>
+    ch.owner === pid && !ch.activatedThisRound && ch.health > 0
+  );
   if (!eligible.length) return null;
   return eligible
-    .map(u => ({ u, s: scoreActivationPriority(state, pid, u, ctx) }))
-    .sort((a, b) => b.s - a.s)[0].u;
+    .map(ch => ({ ch, s: scoreActivationPriority(state, pid, ch, ctx) }))
+    .sort((a, b) => b.s - a.s)[0].ch;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   DECIDE WHAT THE PICKED UNIT DOES
-   Returns an array of actions (the bot dispatches them sequentially).
-   ══════════════════════════════════════════════════════════════ */
-function planActivation(state, pid, unit, ctx) {
-  // Reserve unit → deploy
-  if (inReserves(unit)) {
-    if (unit.currentSupplyValue > availSupply(state, pid)) return null; // cannot afford
-    const pts = getLegalDeployDestinations(state, pid, unit.id, unit.leadingModelId);
-    if (!pts.length) return null;
-    const scored = pts.map(p => ({ p, s: scorePosition(state, pid, unit, p, ctx) }))
-      .sort((a, b) => b.s - a.s);
-    const best = scored[0].p;
-    return [{
-      type: "DEPLOY_UNIT",
-      payload: {
-        playerId: pid, unitId: unit.id, leadingModelId: unit.leadingModelId,
-        entryPoint: best.entryPoint,
-        path: [best.entryPoint, { x: best.x, y: best.y }],
-        modelPlacements: autoArrangeModels(state, unit.id, best)
-      }
-    }];
-  }
+/* ── Plan activation for a character ── */
+function planActivation(state, pid, ch, ctx) {
+  const actions = [];
+  const cp = charPoint(ch);
+  if (!cp) return [{ type: "HOLD", payload: { playerId: pid, charId: ch.id } }];
 
-  // Battlefield unit
-  // Engaged → try Disengage with Tactical Mass; else Charge if hasM; else Hold
-  if (unit.status.engaged) {
-    if (hasM(unit)) {
-      // Charge back at the engaging enemy
-      const enemies = Object.values(state.units).filter(u => u.owner === opp(pid) && onField(u));
-      const targets = enemies
-        .map(t => ({ t, s: scoreChargeViability(unit, t) }))
-        .filter(x => x.s > 0)
-        .sort((a, b) => b.s - a.s);
-      if (targets.length) {
-        return [{
-          type: "DECLARE_CHARGE",
-          payload: { playerId: pid, unitId: unit.id, targetId: targets[0].t.id }
-        }];
-      }
-    }
-    // Disengage if we have tactical mass
-    const pts = getLegalDisengageDestinations(state, pid, unit.id, unit.leadingModelId);
-    if (pts.length) {
-      const scored = pts.map(p => ({ p, s: scorePosition(state, pid, unit, p, ctx) }))
-        .sort((a, b) => b.s - a.s);
-      return [{
-        type: "DISENGAGE_UNIT",
-        payload: {
-          playerId: pid, unitId: unit.id, leadingModelId: unit.leadingModelId,
-          path: bPath(unit, scored[0].p),
-          modelPlacements: autoArrangeModels(state, unit.id, scored[0].p)
-        }
-      }];
-    }
-    return [{ type: "HOLD_UNIT", payload: { playerId: pid, unitId: unit.id } }];
-  }
+  const enemies = Object.values(state.characters).filter(e => e.owner !== pid && onField(e));
+  const friends = Object.values(state.characters).filter(f => f.owner === pid && f.id !== ch.id && onField(f));
 
-  // Free unit. Decide between (Move + Action), Run, or Charge from current position.
-  const enemies = Object.values(state.units).filter(u => u.owner === opp(pid) && onField(u));
-
-  // Can we charge from here?
-  let bestCharge = null;
-  if (hasM(unit)) {
-    const candidates = enemies
-      .map(t => ({ t, s: scoreChargeViability(unit, t) }))
-      .filter(x => x.s > 0)
-      .sort((a, b) => b.s - a.s);
-    if (candidates.length) bestCharge = candidates[0];
-  }
-  // Can we shoot from here?
-  let bestShot = null;
-  if (hasR(unit)) {
-    const candidates = enemies
-      .map(t => ({ t, s: scoreTarget(state, pid, unit, t, ctx) + scoreRangedRange(unit, t) }))
-      .filter(x => x.s > -Infinity)
-      .sort((a, b) => b.s - a.s);
-    if (candidates.length) bestShot = candidates[0];
-  }
-
-  // Movement candidates
-  const movePts = getLegalMoveDestinations(state, pid, unit.id, unit.leadingModelId);
-  const moveBest = movePts.length
-    ? movePts.map(p => ({ p, s: scorePosition(state, pid, unit, p, ctx) })).sort((a, b) => b.s - a.s)[0]
-    : null;
-
-  // Strategy: if charge available and viable, prefer it
-  if (bestCharge && bestCharge.s >= 6) {
-    return [{
-      type: "DECLARE_CHARGE",
-      payload: { playerId: pid, unitId: unit.id, targetId: bestCharge.t.id }
-    }];
-  }
-  // If shot available and a clear win, prefer move-then-shoot
-  if (bestShot && bestShot.s >= 4) {
-    const actions = [];
-    if (moveBest) {
-      actions.push({
-        type: "MOVE_UNIT",
-        payload: {
-          playerId: pid, unitId: unit.id, leadingModelId: unit.leadingModelId,
-          path: bPath(unit, moveBest.p),
-          modelPlacements: autoArrangeModels(state, unit.id, moveBest.p)
-        }
+  // Cleric: Rally if a friend needs it
+  if (ch.classId === "cleric") {
+    const needsRally = friends
+      .filter(f => {
+        const d = distance(cp, charPoint(f));
+        return d <= 6 && (hasCondition(f, "pinned") || hasCondition(f, "exposed") || f.readiness === "spent");
+      })
+      .sort((a, b) => {
+        // Prioritize most damaged / worst conditions
+        const aScore = (hasCondition(a, "pinned") ? 3 : 0) + (hasCondition(a, "exposed") ? 2 : 0) + (a.readiness === "spent" ? 1 : 0);
+        const bScore = (hasCondition(b, "pinned") ? 3 : 0) + (hasCondition(b, "exposed") ? 2 : 0) + (b.readiness === "spent" ? 1 : 0);
+        return bScore - aScore;
       });
+    if (needsRally.length) {
+      // Move toward the friend first if needed
+      const target = needsRally[0];
+      const td = distance(cp, charPoint(target));
+      if (td > 6) {
+        // move closer
+        const moveDest = moveToward(state, pid, ch, charPoint(target), ch.move);
+        if (moveDest) actions.push({ type: "MOVE", payload: { playerId: pid, charId: ch.id, destination: moveDest } });
+      }
+      actions.push({ type: "CLASS_ABILITY", payload: { playerId: pid, charId: ch.id, abilityId: "rally", targetId: target.id } });
+      return actions;
     }
-    actions.push({
-      type: "DECLARE_RANGED_ATTACK",
-      payload: { playerId: pid, unitId: unit.id, targetId: bestShot.t.id }
-    });
+  }
+
+  // Mage: Disrupt if enemy in range
+  if (ch.classId === "mage") {
+    const inRange = enemies.filter(e => distance(cp, charPoint(e)) <= 8);
+    if (inRange.length) {
+      // Target highest priority
+      const target = inRange
+        .map(e => ({ e, s: scoreTarget(state, pid, ch, e, ctx) }))
+        .sort((a, b) => b.s - a.s)[0]?.e;
+      if (target) {
+        // Move first if beneficial
+        const moveDest = bestMoveDestination(state, pid, ch, ctx);
+        if (moveDest) actions.push({ type: "MOVE", payload: { playerId: pid, charId: ch.id, destination: moveDest } });
+        actions.push({ type: "CLASS_ABILITY", payload: { playerId: pid, charId: ch.id, abilityId: "disrupt", targetId: target.id } });
+        return actions;
+      }
+    }
+  }
+
+  // Attack: find best target
+  let bestAttackAction = null;
+  let bestAttackScore = -Infinity;
+
+  if (ch.attacks) {
+    for (const [attackKey, atk] of Object.entries(ch.attacks)) {
+      const range = atk.type === "melee" ? 1.5 : (atk.range ?? 8);
+      for (const e of enemies) {
+        const ep = charPoint(e);
+        if (!ep) continue;
+        const d = distance(cp, ep);
+        if (d > range + 1e-6) continue;
+        // Backstab requires Exposed/Spent
+        if (attackKey === "backstab" && !hasCondition(e, "exposed") && e.readiness !== "spent") continue;
+        let s = scoreTarget(state, pid, ch, e, ctx);
+        // Prefer attacks that create conditions (Suppressing, Called)
+        if (atk.appliesPinned) s += 5;
+        if (atk.appliesExposed) s += 4;
+        if (s > bestAttackScore) {
+          bestAttackScore = s;
+          bestAttackAction = { type: "ATTACK", payload: { playerId: pid, charId: ch.id, targetId: e.id, attackKey } };
+        }
+      }
+    }
+  }
+
+  // If can attack from here
+  if (bestAttackAction) {
+    // Try to move first for better position
+    const moveDest = bestMoveDestination(state, pid, ch, ctx);
+    if (moveDest && !ch.movementUsed) {
+      actions.push({ type: "MOVE", payload: { playerId: pid, charId: ch.id, destination: moveDest } });
+    }
+    actions.push(bestAttackAction);
     return actions;
   }
-  // No good attack — Run if it'd improve position significantly
-  if (moveBest) {
-    const runPts = getLegalRunDestinations(state, pid, unit.id, unit.leadingModelId);
-    if (runPts.length) {
-      const runBest = runPts.map(p => ({ p, s: scorePosition(state, pid, unit, p, ctx) }))
-        .sort((a, b) => b.s - a.s)[0];
-      if (runBest && runBest.s > moveBest.s + 4) {
-        return [{
-          type: "RUN_UNIT",
-          payload: {
-            playerId: pid, unitId: unit.id, leadingModelId: unit.leadingModelId,
-            path: bPath(unit, runBest.p),
-            modelPlacements: autoArrangeModels(state, unit.id, runBest.p)
+
+  // Check if moving puts us in attack range
+  const moveDest = bestMoveDestination(state, pid, ch, ctx);
+  if (moveDest) {
+    // After moving, can we attack?
+    const movedPos = moveDest;
+    let bestAfterMove = null;
+    let bestAfterMoveScore = -Infinity;
+    if (ch.attacks) {
+      for (const [attackKey, atk] of Object.entries(ch.attacks)) {
+        const range = atk.type === "melee" ? 1.5 : (atk.range ?? 8);
+        for (const e of enemies) {
+          const ep = charPoint(e);
+          if (!ep) continue;
+          const d = distance(movedPos, ep);
+          if (d > range + 1e-6) continue;
+          if (attackKey === "backstab" && !hasCondition(e, "exposed") && e.readiness !== "spent") continue;
+          const s = scoreTarget(state, pid, ch, e, ctx);
+          if (s > bestAfterMoveScore) {
+            bestAfterMoveScore = s;
+            bestAfterMove = { type: "ATTACK", payload: { playerId: pid, charId: ch.id, targetId: e.id, attackKey } };
           }
-        }];
+        }
       }
+    }
+    if (bestAfterMove) {
+      actions.push({ type: "MOVE", payload: { playerId: pid, charId: ch.id, destination: moveDest } });
+      actions.push(bestAfterMove);
+      return actions;
+    }
+    // Secure objective if near one
+    const nearObj = state.board.objectives.find(obj => distance(movedPos, obj) <= OBJECTIVE_RANGE);
+    if (nearObj && !hasCondition(ch, "pinned")) {
+      actions.push({ type: "MOVE", payload: { playerId: pid, charId: ch.id, destination: moveDest } });
+      actions.push({ type: "SECURE_OBJECTIVE", payload: { playerId: pid, charId: ch.id } });
+      return actions;
     }
     // Just move
-    return [{
-      type: "MOVE_UNIT",
-      payload: {
-        playerId: pid, unitId: unit.id, leadingModelId: unit.leadingModelId,
-        path: bPath(unit, moveBest.p),
-        modelPlacements: autoArrangeModels(state, unit.id, moveBest.p)
-      }
-    }];
+    actions.push({ type: "MOVE", payload: { playerId: pid, charId: ch.id, destination: moveDest } });
+    return actions;
   }
-  // Last resort
-  return [{ type: "HOLD_UNIT", payload: { playerId: pid, unitId: unit.id } }];
+
+  // Recover if Pinned/Exposed/Spent
+  if (hasCondition(ch, "pinned") || hasCondition(ch, "exposed") || ch.readiness === "spent") {
+    actions.push({ type: "RECOVER", payload: { playerId: pid, charId: ch.id } });
+    return actions;
+  }
+
+  // Secure nearby objective
+  const nearObj = state.board.objectives.find(obj => distance(cp, obj) <= OBJECTIVE_RANGE);
+  if (nearObj && !hasCondition(ch, "pinned") && !ch.actionUsed) {
+    actions.push({ type: "SECURE_OBJECTIVE", payload: { playerId: pid, charId: ch.id } });
+    return actions;
+  }
+
+  // Last resort: Hold
+  return [{ type: "HOLD", payload: { playerId: pid, charId: ch.id } }];
 }
 
-/* ══════════════════════════════════════════════════════════════
-   CARD PLAY
-   ══════════════════════════════════════════════════════════════ */
-function bestCard(state, pid, ctx, aboutToActId) {
-  const actions = getLegalActionsForPlayer(state, pid).filter(x => x.type === "PLAY_CARD" && x.enabled);
-  if (!actions.length) return null;
-  let bc = null, bs = -1;
-  for (const act of actions) {
-    const card = getTacticalCard(act.cardId);
-    let sc = 3;
-    if (card.effect?.modifiers?.some(m => m.key === "unit.speed")) {
-      if (!act.targetUnitId || !state.units[act.targetUnitId] || !onField(state.units[act.targetUnitId])) continue;
-      const u = state.units[act.targetUnitId];
-      const p = lp(u);
-      if (!p) continue;
-      const nd = Math.min(...ctx.objPriorities.filter(o => o.controller !== pid).map(o => distance(p, o)).concat([999]));
-      sc += Math.min(12, nd) + u.currentSupplyValue * 1.5;
+function bestMoveDestination(state, pid, ch, ctx) {
+  const cp = charPoint(ch);
+  if (!cp || ch.movementUsed) return null;
+  let best = null, bestScore = -Infinity;
+  const maxDist = ch.move;
+  for (let x = 0.5; x < state.board.widthInches; x += 1) {
+    for (let y = 0.5; y < state.board.heightInches; y += 1) {
+      const d = Math.max(Math.abs(x - cp.x), Math.abs(y - cp.y));
+      if (d > maxDist + 1e-6 || d < 0.5) continue;
+      // Skip blocking terrain
+      const blocked = state.board.terrain.some(t => {
+        if (!t.impassable || !t.rect) return false;
+        return x >= t.rect.minX && x <= t.rect.maxX && y >= t.rect.minY && y <= t.rect.maxY;
+      });
+      if (blocked) continue;
+      const pt = { x, y };
+      const s = scorePosition(state, pid, ch, pt, ctx);
+      if (s > bestScore) { bestScore = s; best = pt; }
     }
-    if (card.effect?.modifiers?.some(m => ["weapon.hitTarget", "weapon.attacksPerModel", "weapon.shotsPerModel"].includes(m.key))) {
-      if (!act.targetUnitId) continue;
-      const u = state.units[act.targetUnitId];
-      if (!u || !onField(u)) continue;
-      if (aboutToActId && act.targetUnitId === aboutToActId) sc += 20;
-      else if (aboutToActId) continue;
-      sc += alive(u) * 2 + u.currentSupplyValue * 2;
-    }
-    if (sc > bs) { bs = sc; bc = act; }
   }
-  if (!bc) return null;
-  return { type: "PLAY_CARD", payload: { playerId: pid, cardInstanceId: bc.cardInstanceId, targetUnitId: bc.targetUnitId ?? null } };
+  return best;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   PUBLIC API
-   ══════════════════════════════════════════════════════════════ */
+function moveToward(state, pid, ch, target, maxDist) {
+  const cp = charPoint(ch);
+  if (!cp) return null;
+  // Move directly toward target up to maxDist
+  const dx = target.x - cp.x, dy = target.y - cp.y;
+  const len = Math.hypot(dx, dy);
+  if (len <= 1e-6) return null;
+  const actualDist = Math.min(maxDist, len);
+  const nx = Math.round(cp.x + (dx / len) * actualDist - 0.5) + 0.5;
+  const ny = Math.round(cp.y + (dy / len) * actualDist - 0.5) + 0.5;
+  return { x: Math.max(0.5, Math.min(state.board.widthInches - 0.5, nx)), y: Math.max(0.5, Math.min(state.board.heightInches - 0.5, ny)) };
+}
 
-/**
- * performBotTurn dispatches one or more actions to advance the bot's turn.
- * In the new model, an "activation" is a sequence of actions, so this may
- * dispatch a Move followed by a Shoot, etc. Returns the result of the last
- * dispatch.
- */
+/* ── Public API ── */
 export async function performBotTurn(store, pid) {
   const state = store.getState();
   if (state.activePlayer !== pid) return { ok: true, state };
   if (state.phase !== "battle") return { ok: true, state };
   if (state.players[pid].passedThisRound) return { ok: true, state };
 
-  // Already mid-activation? Continue with that unit.
-  if (state.activatingUnitId) {
-    const unit = state.units[state.activatingUnitId];
-    if (!unit) return store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid } });
+  // Mid-activation: continue with active character
+  if (state.activatingCharacterId) {
+    const ch = state.characters[state.activatingCharacterId];
+    if (!ch) return store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: state.activatingCharacterId } });
     const ctx = assess(state, pid);
-    const actions = planActivation(state, pid, unit, ctx);
-    if (!actions || !actions.length) {
-      return store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid } });
-    }
+    const actions = planActivation(state, pid, ch, ctx);
     let last = { ok: true, state };
     for (const act of actions) {
+      const current = store.getState();
+      if (current.activatingCharacterId !== ch.id && act.type !== "HOLD") continue;
       last = store.dispatch(act);
-      if (!last.ok) return last;
-      // tiny delay between sub-actions
-      await new Promise(r => setTimeout(r, 200));
+      if (!last.ok) {
+        if (store.getState().activatingCharacterId) {
+          store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: ch.id } });
+        }
+        return last;
+      }
+      await new Promise(r => setTimeout(r, 150));
     }
     return last;
   }
 
   const ctx = assess(state, pid);
-
-  // No more units? Pass.
-  const next = pickNextUnit(state, pid, ctx);
+  const next = pickNextCharacter(state, pid, ctx);
   if (!next) {
     return store.dispatch({ type: "PASS_ROUND", payload: { playerId: pid } });
   }
 
-  // Maybe play a card before activating
-  const card = bestCard(state, pid, ctx, next.id);
-  if (card) {
-    const r = store.dispatch(card);
-    if (r.ok) await new Promise(r => setTimeout(r, 250));
-  }
-
-  // Plan and execute actions
   const actions = planActivation(state, pid, next, ctx);
   if (!actions || !actions.length) {
-    // Reserve units can't Hold; fall back to passing the round
-    if (inReserves(next)) {
-      return store.dispatch({ type: "PASS_ROUND", payload: { playerId: pid } });
-    }
-    return store.dispatch({ type: "HOLD_UNIT", payload: { playerId: pid, unitId: next.id } });
+    return store.dispatch({ type: "HOLD", payload: { playerId: pid, charId: next.id } });
   }
+
   let last = { ok: true, state };
   for (const act of actions) {
     last = store.dispatch(act);
     if (!last.ok) {
-      // If a planned action fails (e.g. position changed mid-sequence), try to clean up
-      if (store.getState().activatingUnitId) {
-        store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid } });
+      if (store.getState().activatingCharacterId) {
+        store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: next.id } });
       }
       return last;
     }
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 150));
   }
   return last;
 }

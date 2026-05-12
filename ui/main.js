@@ -1,41 +1,18 @@
+// v0.12 Main UI controller
 import { createInitialGameState } from "../engine/state.js";
 import { beginGame } from "../engine/phases.js";
 import { dispatch as engineDispatch } from "../engine/reducer.js";
 import {
   bindInputHandlers,
-  beginMoveInteraction, beginDeployInteraction, beginDisengageInteraction, beginRunInteraction,
-  beginDeclareRangedInteraction, beginDeclareChargeInteraction, cancelCurrentInteraction
+  beginMoveInteraction, beginRunInteraction,
+  beginAttackInteraction, beginClassAbilityInteraction,
+  cancelCurrentInteraction
 } from "./input.js";
 import { renderAll } from "./renderer.js";
-import { autoArrangeModels } from "../engine/coherency.js";
 import { performBotTurn } from "../ai/bot.js";
 import { screenToBoardPoint } from "./board.js";
-import { getTacticalCard } from "../data/tactical_cards.js";
 import { snapPointToGrid } from "../engine/geometry.js";
-
-const DEFAULT_SETUP = {
-  missionId: "hold_the_keep",
-  deploymentId: "valley",
-  firstPlayerThisRound: "playerA",
-  armyA: [
-    { id: "crown_castellan", templateId: "castellan" },
-    { id: "crown_crossbows", templateId: "crossbowmen" },
-    { id: "crown_knights_1", templateId: "knights" },
-    { id: "crown_knights_2", templateId: "knights" },
-    { id: "crown_spearmen", templateId: "levy_spearmen" },
-    { id: "crown_surgeon", templateId: "battle_surgeon" }
-  ],
-  armyB: [
-    { id: "reaver_champion", templateId: "reaver_champion" },
-    { id: "reaver_wolves", templateId: "wolfriders" },
-    { id: "reaver_brutes", templateId: "trollkin_brutes" },
-    { id: "reaver_berserkers", templateId: "berserkers" },
-    { id: "reaver_skirmishers", templateId: "reaver_skirmishers" }
-  ],
-  tacticalCardsA: ["aim_carefully", "war_banner", "forced_march"],
-  tacticalCardsB: ["bloodlust", "drill_master", "veterans"],
-  rules: { gridMode: true }
-};
+import { hasCondition } from "../engine/conditions.js";
 
 function createStore(initialState) {
   let state = initialState;
@@ -65,57 +42,54 @@ function createStore(initialState) {
 }
 
 const uiState = {
-  selectedUnitId: null,
+  selectedCharId: null,
   mode: null,
   previewPath: null,
   previewUnit: null,
+  pendingAttackKey: null,
+  pendingAbilityId: null,
   locked: false,
   lastError: null,
   notifications: [],
   lastSeenLogCount: 0,
-  pendingPass: false
+  pendingPass: false,
+  gridMode: true
 };
 
 let store;
 
 function buildInitialState() {
-  const state = createInitialGameState(DEFAULT_SETUP);
+  const state = createInitialGameState();
   beginGame(state);
   return state;
 }
 
-function getSelectedUnit(state) {
-  const id = state.activatingUnitId ?? uiState.selectedUnitId;
-  return id ? state.units[id] : null;
+function getSelectedCharacter(state) {
+  const id = state.activatingCharacterId ?? uiState.selectedCharId;
+  return id ? state.characters[id] : null;
 }
 
-function selectUnit(unitId) {
-  // While a unit is mid-activation, selecting another unit isn't allowed
+function selectCharacter(charId) {
   const state = store.getState();
-  if (state.activatingUnitId && state.activatingUnitId !== unitId) {
+  if (state.activatingCharacterId && state.activatingCharacterId !== charId) {
     showError("Finish the current activation first.");
     return;
   }
-  uiState.selectedUnitId = unitId;
+  uiState.selectedCharId = charId;
   cancelCurrentInteraction(uiState);
   rerender();
 }
 
-function autoSelectNextUnit() {
+function autoSelectNextCharacter() {
   const state = store.getState();
   if (state.activePlayer !== "playerA") return;
-  if (state.activatingUnitId) {
-    uiState.selectedUnitId = state.activatingUnitId;
+  if (state.activatingCharacterId) {
+    uiState.selectedCharId = state.activatingCharacterId;
     return;
   }
-  const ids = [
-    ...state.players.playerA.battlefieldUnitIds,
-    ...state.players.playerA.reserveUnitIds
-  ];
-  for (const uid of ids) {
-    const u = state.units[uid];
-    if (u && !u.status.activatedThisRound) {
-      uiState.selectedUnitId = uid;
+  for (const ch of Object.values(state.characters)) {
+    if (ch.owner === "playerA" && !ch.activatedThisRound && ch.health > 0) {
+      uiState.selectedCharId = ch.id;
       return;
     }
   }
@@ -124,71 +98,58 @@ function autoSelectNextUnit() {
 function getActivationChecklist() {
   const state = store.getState();
   if (state.activePlayer !== "playerA") return { total: 0, done: 0, remaining: [] };
-  const ids = [
-    ...state.players.playerA.battlefieldUnitIds,
-    ...state.players.playerA.reserveUnitIds
-  ];
+  const chars = Object.values(state.characters).filter(c => c.owner === "playerA" && c.health > 0);
   let done = 0;
   const remaining = [];
-  for (const uid of ids) {
-    const u = state.units[uid];
-    if (!u) continue;
-    if (u.status.activatedThisRound) done += 1;
-    else remaining.push(u.name);
+  for (const ch of chars) {
+    if (ch.activatedThisRound) done += 1;
+    else remaining.push(ch.name);
   }
-  return { total: ids.length, done, remaining };
+  return { total: chars.length, done, remaining };
 }
 
 function getModeText() {
   if (uiState.lastError) return uiState.lastError;
   const state = store.getState();
-  const unit = getSelectedUnit(state);
+  const ch = getSelectedCharacter(state);
   const ck = getActivationChecklist();
   const progress = ck.total > 0 ? ` [${ck.done}/${ck.total}]` : "";
 
   if (uiState.pendingPass) return "⚠ Press Pass again to surrender remaining activations this round.";
-  if (uiState.locked) return "⏳ Reavers are taking their turn…";
-  if (state.activePlayer !== "playerA") return "Waiting for Reavers…";
+  if (uiState.locked) return "⏳ Player B is taking their turn…";
+  if (state.activePlayer !== "playerA") return "Waiting for Player B…";
+  if (state.winner) return `Game over! ${state.winner === "playerA" ? "Player A" : "Player B"} wins!`;
 
-  if (state.activatingUnitId) {
-    const u = state.units[state.activatingUnitId];
-    const movePart = u.status.movementUsed ? "Move✓" : "Move available";
-    const actPart = u.status.actionUsed ? "Action✓" : "Action available";
-    if (uiState.mode === "deploy") return `Deploy ${u.name} — click on your edge to enter.${progress}`;
-    if (uiState.mode === "move") return `Move ${u.name} — click within ${u.speed}".${progress}`;
-    if (uiState.mode === "run") return `Run ${u.name} — up to ${u.speed + 2}", consumes the whole activation.${progress}`;
-    if (uiState.mode === "disengage") return `Disengage ${u.name} — break free; outweighed = no shoot/charge.${progress}`;
-    if (uiState.mode === "declare_ranged") {
-      const w = u.rangedWeapons?.[0];
-      return `Shoot — click an enemy in range.${w ? ` ${w.name}: ${w.rangeInches}" rng, ${w.hitTarget}+ hit.` : ""}${progress}`;
-    }
-    if (uiState.mode === "declare_charge") return `Charge — click an enemy within 8". Resolves immediately.${progress}`;
-    return `${u.name} is acting. ${movePart} · ${actPart}.${progress}`;
+  if (state.activatingCharacterId) {
+    const c = state.characters[state.activatingCharacterId];
+    const movePart = c.movementUsed ? "Move✓" : "Move";
+    const actPart = c.actionUsed ? "Act✓" : "Act";
+    if (uiState.mode === "move") return `Move ${c.name} — click destination (max ${c.move}").${progress}`;
+    if (uiState.mode === "run") return `Run ${c.name} — click destination (max 9", becomes Spent).${progress}`;
+    if (uiState.mode === "attack") return `Attack with ${c.name} (${uiState.pendingAttackKey}) — click an enemy.${progress}`;
+    if (uiState.mode === "class_ability") return `${c.name} class ability (${uiState.pendingAbilityId}) — click target.${progress}`;
+    return `${c.name} activating. ${movePart} · ${actPart}.${progress}`;
   }
 
-  if (uiState.mode === "deploy" && unit) return `Deploy ${unit.name} — click on your edge.${progress}`;
-
   if (state.phase === "battle") {
-    if (ck.remaining.length > 0) {
-      return `Pick a unit to activate — Move + one Action (Shoot OR Charge), or Run.${progress}`;
-    }
-    return `All your units have activated. Pass to end the round.${progress}`;
+    if (ck.remaining.length > 0) return `Pick a character to activate.${progress}`;
+    return `All characters activated. Pass to end round.${progress}`;
   }
   return `Round ending…${progress}`;
 }
 
 function rerender() {
   const handlers = {
-    onUnitSelect: selectUnit,
+    onCharSelect: selectCharacter,
+    onCharClick: handleCharClick,
     onBoardClick: handleBoardClick,
-    onModelClick: handleModelClick,
     buildActionButtons,
-    buildCardButtons,
     getModeText,
     getPhaseChecklist: getActivationChecklist
   };
   renderAll(store.getState(), uiState, handlers);
   renderNotifications();
+  renderChecklist();
 }
 
 function showError(msg) {
@@ -199,7 +160,7 @@ function showError(msg) {
   showError.timer = window.setTimeout(() => { uiState.lastError = null; rerender(); }, 4200);
 }
 
-function pushToast(message, tone = "info", durationMs = 5200) {
+function pushToast(message, tone = "info", durationMs = 5000) {
   const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   uiState.notifications.push({ id, message, tone });
   if (uiState.notifications.length > 5) uiState.notifications.shift();
@@ -217,9 +178,18 @@ function renderNotifications() {
   uiState.notifications.forEach(n => {
     const t = document.createElement("div");
     t.className = `toast ${n.tone}`;
-    t.innerHTML = `<div class="toast-meta">Battle Update</div><div>${n.message}</div>`;
+    t.innerHTML = `<div class="toast-meta">Update</div><div>${n.message}</div>`;
     stack.appendChild(t);
   });
+}
+
+function renderChecklist() {
+  const ck = getActivationChecklist();
+  const ckEl = document.getElementById("phaseChecklist");
+  if (!ckEl) return;
+  const pct = ck.total > 0 ? Math.round(ck.done / ck.total * 100) : 0;
+  ckEl.innerHTML = `<div class="ck-bar"><div class="ck-fill" style="width:${pct}%"></div></div><div class="ck-label">${ck.done}/${ck.total}</div>` +
+    (ck.remaining.length ? `<div class="ck-remaining">${ck.remaining.map(n => `<span class="ck-unit">${n}</span>`).join("")}</div>` : "");
 }
 
 function publishLogNotifications(state) {
@@ -247,145 +217,108 @@ function buildActionButtons() {
   const buttons = [];
   if (state.activePlayer !== "playerA") return buttons;
   if (state.players.playerA.passedThisRound) return buttons;
+  if (state.winner) return buttons;
 
-  // Cancel button when in interaction mode
+  // Cancel
   buttons.push(actionButton("Cancel", "secondary", () => {
     cancelCurrentInteraction(uiState);
     rerender();
-  }, !uiState.mode, "No active interaction to cancel."));
+  }, !uiState.mode));
 
-  const activatingId = state.activatingUnitId;
-  const selectedId = uiState.selectedUnitId;
+  const activatingId = state.activatingCharacterId;
+  const selectedId = uiState.selectedCharId;
   const id = activatingId ?? selectedId;
   if (!id) return buttons;
-  const unit = state.units[id];
-  if (!unit || unit.owner !== "playerA") return buttons;
-  if (!activatingId && unit.status.activatedThisRound) return buttons;
+  const ch = state.characters[id];
+  if (!ch || ch.owner !== "playerA" || ch.health <= 0) return buttons;
+  if (!activatingId && ch.activatedThisRound) return buttons;
 
   const inActivation = !!activatingId;
-  const movementUsed = !!unit.status.movementUsed;
-  const actionUsed = !!unit.status.actionUsed;
+  const movementUsed = !!ch.movementUsed;
+  const actionUsed = !!ch.actionUsed;
 
-  // Deploy from reserves — always begins activation
-  if (unit.status.location === "reserves") {
-    if (!inActivation || activatingId === unit.id) {
-      buttons.unshift(actionButton("Deploy", "primary", () => {
-        beginDeployInteraction(state, uiState, unit.id);
-        rerender();
-      }));
-    }
-    return buttons;
-  }
-
-  // Battlefield unit
-  // Move — available before movement is used and not engaged
-  if (!movementUsed && !unit.status.engaged) {
-    buttons.unshift(actionButton("Move", "primary", () => {
-      beginMoveInteraction(state, uiState, unit.id);
-      rerender();
-    }));
-  }
-
-  // Disengage — when engaged
-  if (!movementUsed && unit.status.engaged) {
-    buttons.unshift(actionButton("Disengage", "warn", () => {
-      beginDisengageInteraction(state, uiState, unit.id);
-      rerender();
-    }));
-  }
-
-  // Run — both slots empty, not engaged. Burns full activation.
-  if (!movementUsed && !actionUsed && !unit.status.engaged) {
-    buttons.unshift(actionButton("Run", "secondary", () => {
-      beginRunInteraction(state, uiState, unit.id);
-      rerender();
-    }));
-  }
-
-  // Action: Shoot or Charge
-  if (!actionUsed && !unit.status.runThisActivation) {
-    if (unit.rangedWeapons?.length) {
-      buttons.unshift(actionButton("Shoot", "secondary", () => {
-        beginDeclareRangedInteraction(uiState);
-        rerender();
-      }));
-    }
-    if (unit.meleeWeapons?.length) {
-      buttons.unshift(actionButton("Charge", "warn", () => {
-        beginDeclareChargeInteraction(uiState);
-        rerender();
-      }));
-    }
-  }
-
-  // Hold — only when no activation has begun (it's a "do nothing" activation)
+  // HOLD — before any activation
   if (!inActivation) {
     buttons.push(actionButton("Hold", "secondary", () => {
-      const result = store.dispatch({ type: "HOLD_UNIT", payload: { playerId: "playerA", unitId: unit.id } });
+      const result = store.dispatch({ type: "HOLD", payload: { playerId: "playerA", charId: ch.id } });
       if (!result.ok) showError(result.message);
-      else { autoSelectNextUnit(); rerender(); }
+      else { autoSelectNextCharacter(); rerender(); }
     }));
   }
 
-  // End Activation — when activation in progress (used at least one slot, want to skip the rest)
+  // MOVE
+  if (!movementUsed) {
+    buttons.unshift(actionButton("Move", "primary", () => {
+      beginMoveInteraction(state, uiState, ch.id);
+      rerender();
+    }));
+  }
+
+  // RUN — both slots free, not Pinned
+  if (!movementUsed && !actionUsed && !hasCondition(ch, "pinned")) {
+    buttons.unshift(actionButton("Run", "secondary", () => {
+      beginRunInteraction(state, uiState, ch.id);
+      rerender();
+    }));
+  }
+
+  // ACTIONS
+  if (!actionUsed) {
+    // RECOVER
+    buttons.push(actionButton("Recover", "secondary", () => {
+      const result = store.dispatch({ type: "RECOVER", payload: { playerId: "playerA", charId: ch.id } });
+      if (!result.ok) showError(result.message);
+      else { autoSelectNextCharacter(); rerender(); }
+    }));
+
+    // SECURE OBJECTIVE
+    if (!hasCondition(ch, "pinned")) {
+      buttons.push(actionButton("Secure Obj", "secondary", () => {
+        const result = store.dispatch({ type: "SECURE_OBJECTIVE", payload: { playerId: "playerA", charId: ch.id } });
+        if (!result.ok) showError(result.message);
+        else { autoSelectNextCharacter(); rerender(); }
+      }));
+    }
+
+    // ATTACKS
+    if (ch.attacks) {
+      for (const [key, atk] of Object.entries(ch.attacks)) {
+        buttons.unshift(actionButton(atk.name, "warn", () => {
+          beginAttackInteraction(uiState, ch.id, key);
+          rerender();
+        }));
+      }
+    }
+
+    // CLASS ABILITIES
+    if (ch.classId === "cleric") {
+      buttons.push(actionButton("Rally", "primary", () => {
+        beginClassAbilityInteraction(uiState, ch.id, "rally");
+        rerender();
+      }));
+    }
+    if (ch.classId === "mage") {
+      buttons.push(actionButton("Disrupt", "warn", () => {
+        beginClassAbilityInteraction(uiState, ch.id, "disrupt");
+        rerender();
+      }));
+    }
+  }
+
+  // END ACTIVATION
   if (inActivation) {
     buttons.push(actionButton("End Activation", "secondary", () => {
-      const result = store.dispatch({ type: "END_ACTIVATION", payload: { playerId: "playerA" } });
+      const result = store.dispatch({ type: "END_ACTIVATION", payload: { playerId: "playerA", charId: ch.id } });
       if (!result.ok) showError(result.message);
-      else { autoSelectNextUnit(); rerender(); }
+      else { autoSelectNextCharacter(); rerender(); }
     }));
   }
 
   return buttons;
-}
-
-function buildCardButtons() {
-  const state = store.getState();
-  const buttons = [];
-  if (state.activePlayer !== "playerA") return buttons;
-  if (state.players.playerA.passedThisRound) return buttons;
-  if (state.phase !== "battle") return buttons;
-
-  const selected = getSelectedUnit(state);
-  for (const entry of state.players.playerA.hand ?? []) {
-    const card = getTacticalCard(entry.cardId);
-    if (card.target === "friendly_battlefield_unit") {
-      const ok = selected && selected.owner === "playerA" && selected.status.location === "battlefield";
-      const label = ok ? `Play ${card.name} on ${selected.name}` : `Play ${card.name} (select a unit)`;
-      buttons.push(actionButton(label, "secondary", () => {
-        const result = store.dispatch({
-          type: "PLAY_CARD",
-          payload: { playerId: "playerA", cardInstanceId: entry.instanceId, targetUnitId: selected.id }
-        });
-        if (!result.ok) showError(result.message);
-      }, !ok, "Select a friendly battlefield unit first."));
-      continue;
-    }
-    buttons.push(actionButton(`Play ${card.name}`, "secondary", () => {
-      const result = store.dispatch({
-        type: "PLAY_CARD",
-        payload: { playerId: "playerA", cardInstanceId: entry.instanceId, targetUnitId: null }
-      });
-      if (!result.ok) showError(result.message);
-    }));
-  }
-  return buttons;
-}
-
-function computeDeployEntryPoint(state, point) {
-  const side = state.deployment.entryEdges.playerA.side;
-  if (side === "west") return { x: 0, y: point.y };
-  if (side === "east") return { x: state.board.widthInches, y: point.y };
-  if (side === "north") return { x: point.x, y: 0 };
-  return { x: point.x, y: state.board.heightInches };
-}
-
-function canFlankAttack(unit) {
-  return unit.abilities?.includes("flank_attack");
 }
 
 function maybeSnapPoint(state, point) {
-  if (!state.rules?.gridMode) return point;
+  if (!uiState.gridMode) return point;
   return snapPointToGrid(point, state.board);
 }
 
@@ -397,104 +330,68 @@ function handleBoardClick(point) {
   }
   const state = store.getState();
   const snapped = maybeSnapPoint(state, point);
-  const unit = getSelectedUnit(state);
-  if (!unit || state.activePlayer !== "playerA") return;
+  const ch = getSelectedCharacter(state);
+  if (!ch || state.activePlayer !== "playerA") return;
 
-  if (uiState.mode === "deploy") {
-    const entry = canFlankAttack(unit) ? snapped : computeDeployEntryPoint(state, snapped);
-    const path = canFlankAttack(unit) ? [entry, entry] : [entry, snapped];
-    const result = store.dispatch({
-      type: "DEPLOY_UNIT",
-      payload: {
-        playerId: "playerA", unitId: unit.id, leadingModelId: unit.leadingModelId,
-        entryPoint: entry, path, modelPlacements: autoArrangeModels(state, unit.id, snapped)
-      }
-    });
-    if (!result.ok) return showError(result.message);
-    cancelCurrentInteraction(uiState);
-    autoSelectNextUnit();
-    rerender();
-    return;
-  }
   if (uiState.mode === "move") {
-    const leader = unit.models[unit.leadingModelId];
-    const path = [{ x: leader.x, y: leader.y }, snapped];
     const result = store.dispatch({
-      type: "MOVE_UNIT",
-      payload: {
-        playerId: "playerA", unitId: unit.id, leadingModelId: unit.leadingModelId,
-        path, modelPlacements: autoArrangeModels(state, unit.id, snapped)
-      }
+      type: "MOVE",
+      payload: { playerId: "playerA", charId: ch.id, destination: snapped }
     });
     if (!result.ok) return showError(result.message);
     cancelCurrentInteraction(uiState);
     rerender();
     return;
   }
+
   if (uiState.mode === "run") {
-    const leader = unit.models[unit.leadingModelId];
-    const path = [{ x: leader.x, y: leader.y }, snapped];
     const result = store.dispatch({
-      type: "RUN_UNIT",
-      payload: {
-        playerId: "playerA", unitId: unit.id, leadingModelId: unit.leadingModelId,
-        path, modelPlacements: autoArrangeModels(state, unit.id, snapped)
-      }
+      type: "RUN",
+      payload: { playerId: "playerA", charId: ch.id, destination: snapped }
     });
     if (!result.ok) return showError(result.message);
     cancelCurrentInteraction(uiState);
-    autoSelectNextUnit();
+    autoSelectNextCharacter();
     rerender();
     return;
-  }
-  if (uiState.mode === "disengage") {
-    const leader = unit.models[unit.leadingModelId];
-    const path = [{ x: leader.x, y: leader.y }, snapped];
-    const result = store.dispatch({
-      type: "DISENGAGE_UNIT",
-      payload: {
-        playerId: "playerA", unitId: unit.id, leadingModelId: unit.leadingModelId,
-        path, modelPlacements: autoArrangeModels(state, unit.id, snapped)
-      }
-    });
-    if (!result.ok) return showError(result.message);
-    cancelCurrentInteraction(uiState);
-    rerender();
   }
 }
 
-function handleModelClick(unitId) {
+function handleCharClick(charId) {
   if (uiState.pendingPass) {
     uiState.pendingPass = false;
     rerender();
   }
   const state = store.getState();
-  const sel = getSelectedUnit(state);
-  const clicked = state.units[unitId];
+  const sel = getSelectedCharacter(state);
+  const clicked = state.characters[charId];
+  if (!clicked) return;
 
-  if (uiState.mode === "declare_ranged" && sel && clicked && sel.owner === "playerA" && clicked.owner === "playerB") {
+  if (uiState.mode === "attack" && sel && clicked.owner !== "playerA") {
     const result = store.dispatch({
-      type: "DECLARE_RANGED_ATTACK",
-      payload: { playerId: "playerA", unitId: sel.id, targetId: clicked.id }
+      type: "ATTACK",
+      payload: { playerId: "playerA", charId: sel.id, targetId: clicked.id, attackKey: uiState.pendingAttackKey }
     });
     if (!result.ok) return showError(result.message);
     cancelCurrentInteraction(uiState);
-    autoSelectNextUnit();
+    autoSelectNextCharacter();
     rerender();
     return;
   }
-  if (uiState.mode === "declare_charge" && sel && clicked && sel.owner === "playerA" && clicked.owner === "playerB") {
+
+  if (uiState.mode === "class_ability" && sel) {
     const result = store.dispatch({
-      type: "DECLARE_CHARGE",
-      payload: { playerId: "playerA", unitId: sel.id, targetId: clicked.id }
+      type: "CLASS_ABILITY",
+      payload: { playerId: "playerA", charId: sel.id, abilityId: uiState.pendingAbilityId, targetId: clicked.id }
     });
     if (!result.ok) return showError(result.message);
     cancelCurrentInteraction(uiState);
-    autoSelectNextUnit();
+    autoSelectNextCharacter();
     rerender();
     return;
   }
-  selectUnit(unitId);
+
+  selectCharacter(charId);
 }
 
 async function maybeRunBot() {
@@ -502,21 +399,23 @@ async function maybeRunBot() {
   const state = store.getState();
   if (state.activePlayer !== "playerB") return;
   if (state.phase !== "battle") return;
+  if (state.winner) return;
   uiState.locked = true;
   rerender();
-  await new Promise(r => setTimeout(r, 420));
+  await new Promise(r => setTimeout(r, 400));
   const result = await performBotTurn(store, "playerB");
-  if (!result.ok) showError(result.message);
+  if (!result.ok) showError(result.message ?? "Bot error");
   uiState.locked = false;
-  if (store.getState().activePlayer === "playerA") autoSelectNextUnit();
+  if (store.getState().activePlayer === "playerA") autoSelectNextCharacter();
   rerender();
-  if (store.getState().activePlayer === "playerB" && store.getState().phase === "battle") {
+  if (store.getState().activePlayer === "playerB" && store.getState().phase === "battle" && !store.getState().winner) {
+    await new Promise(r => setTimeout(r, 300));
     maybeRunBot();
   }
 }
 
 function resetGame() {
-  uiState.selectedUnitId = null;
+  uiState.selectedCharId = null;
   uiState.pendingPass = false;
   cancelCurrentInteraction(uiState);
   const next = buildInitialState();
@@ -524,16 +423,14 @@ function resetGame() {
   store.replaceState(next);
 }
 
-function sanitize(value) { return value.replace(/[^a-z0-9_-]/gi, "_"); }
-
 function exportSaveFile() {
   const state = store.getState();
-  const payload = { version: 2, exportedAt: new Date().toISOString(), state };
+  const payload = { version: 3, exportedAt: new Date().toISOString(), state };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `skirmish-save-${sanitize(state.mission.id ?? "mission")}.json`;
+  link.download = `skirmish-v012-save.json`;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -542,7 +439,7 @@ function exportSaveFile() {
 }
 
 function isValid(s) {
-  return Boolean(s && typeof s === "object" && s.board && s.players && s.units);
+  return Boolean(s && typeof s === "object" && s.board && s.players && s.characters);
 }
 
 function importSaveFile(file) {
@@ -553,12 +450,11 @@ function importSaveFile(file) {
       const parsed = JSON.parse(String(reader.result));
       const imported = parsed?.state ?? parsed;
       if (!isValid(imported)) { showError("Invalid save file."); return; }
-      uiState.selectedUnitId = null;
+      uiState.selectedCharId = null;
       uiState.pendingPass = false;
       cancelCurrentInteraction(uiState);
       uiState.lastSeenLogCount = imported.log?.length ?? 0;
       store.replaceState(imported);
-      document.getElementById("gridModeBtn").textContent = `Grid: ${store.getState().rules.gridMode ? "On" : "Off"}`;
       pushToast("Save loaded.", "success");
     } catch (_e) {
       showError("Could not read this save file.");
@@ -572,9 +468,9 @@ function controller() {
   return {
     onNewGame: resetGame,
     onToggleGridMode: () => {
-      const s = store.getState();
-      s.rules.gridMode = !s.rules.gridMode;
-      document.getElementById("gridModeBtn").textContent = `Grid: ${s.rules.gridMode ? "On" : "Off"}`;
+      uiState.gridMode = !uiState.gridMode;
+      const btn = document.getElementById("gridModeBtn");
+      if (btn) btn.textContent = `Grid: ${uiState.gridMode ? "On" : "Off"}`;
       rerender();
     },
     onExportSave: exportSaveFile,
@@ -587,18 +483,12 @@ function controller() {
     onImportFileSelected: e => importSaveFile(e.target?.files?.[0]),
     onPass: () => {
       const s = store.getState();
-      if (s.activatingUnitId) {
-        showError("Finish the current activation first.");
-        return;
-      }
+      if (s.activatingCharacterId) { showError("Finish the current activation first."); return; }
       if (!uiState.pendingPass) {
         uiState.pendingPass = true;
         rerender();
         window.clearTimeout(controller._timer);
-        controller._timer = window.setTimeout(() => {
-          uiState.pendingPass = false;
-          rerender();
-        }, 3000);
+        controller._timer = window.setTimeout(() => { uiState.pendingPass = false; rerender(); }, 3000);
         return;
       }
       uiState.pendingPass = false;
@@ -612,17 +502,11 @@ controller._timer = null;
 function updatePreviewFromPoint(point) {
   const state = store.getState();
   const snapped = maybeSnapPoint(state, point);
-  const unit = getSelectedUnit(state);
-  if (!unit) return;
-  if (uiState.mode === "deploy") {
-    const entry = canFlankAttack(unit) ? snapped : computeDeployEntryPoint(state, snapped);
-    uiState.previewPath = { path: canFlankAttack(unit) ? [entry, entry] : [entry, snapped] };
-    uiState.previewUnit = { unitId: unit.id, leader: snapped, placements: autoArrangeModels(state, unit.id, snapped) };
-  }
-  if (uiState.mode === "move" || uiState.mode === "disengage" || uiState.mode === "run") {
-    const leader = unit.models[unit.leadingModelId];
-    uiState.previewPath = { path: [{ x: leader.x, y: leader.y }, snapped] };
-    uiState.previewUnit = { unitId: unit.id, leader: snapped, placements: autoArrangeModels(state, unit.id, snapped) };
+  const ch = getSelectedCharacter(state);
+  if (!ch) return;
+  if (uiState.mode === "move" || uiState.mode === "run") {
+    uiState.previewPath = { path: [{ x: ch.x, y: ch.y }, snapped] };
+    uiState.previewUnit = { charId: ch.id, dest: snapped };
   }
 }
 
@@ -640,59 +524,39 @@ function wirePreviewEvents() {
     uiState.previewUnit = null;
     rerender();
   });
-  svg.addEventListener("touchmove", evt => {
-    if (!uiState.mode) return;
-    const t = evt.touches[0];
-    if (!t) return;
-    evt.preventDefault();
-    const p = screenToBoardPoint(svg, t.clientX, t.clientY);
-    updatePreviewFromPoint(p);
-    rerender();
-  }, { passive: false });
 }
 
 function wireKeyboardShortcuts() {
   document.addEventListener("keydown", evt => {
     if (evt.target.tagName === "INPUT" || evt.target.tagName === "TEXTAREA") return;
     const state = store.getState();
-    const unit = getSelectedUnit(state);
+    const ch = getSelectedCharacter(state);
 
     if (evt.key === "Escape") {
       if (uiState.pendingPass) { uiState.pendingPass = false; rerender(); return; }
       if (uiState.mode) { cancelCurrentInteraction(uiState); rerender(); return; }
-      if (!state.activatingUnitId) { uiState.selectedUnitId = null; rerender(); }
+      if (!state.activatingCharacterId) { uiState.selectedCharId = null; rerender(); }
       return;
     }
     if (evt.key === "Tab") {
       evt.preventDefault();
-      if (state.activatingUnitId) return; // can't switch unit mid-activation
-      const ids = [
-        ...state.players.playerA.reserveUnitIds,
-        ...state.players.playerA.battlefieldUnitIds
-      ];
-      const cur = ids.indexOf(uiState.selectedUnitId);
-      for (let i = 1; i <= ids.length; i++) {
-        const next = ids[(cur + i) % ids.length];
-        const u = state.units[next];
-        if (u && !u.status.activatedThisRound) { selectUnit(next); return; }
+      if (state.activatingCharacterId) return;
+      const chars = Object.values(state.characters).filter(c => c.owner === "playerA" && c.health > 0);
+      const cur = chars.findIndex(c => c.id === uiState.selectedCharId);
+      for (let i = 1; i <= chars.length; i++) {
+        const next = chars[(cur + i) % chars.length];
+        if (!next.activatedThisRound) { selectCharacter(next.id); return; }
       }
-      if (ids.length) selectUnit(ids[(cur + 1) % ids.length]);
+      if (chars.length) selectCharacter(chars[(cur + 1) % chars.length].id);
       return;
     }
-    if (state.activePlayer !== "playerA" || !unit || unit.owner !== "playerA") return;
-    if (evt.key === "m" && unit.status.location === "battlefield" && !unit.status.engaged && !unit.status.movementUsed) {
-      beginMoveInteraction(state, uiState, unit.id); rerender();
-    }
-    if (evt.key === "d" && unit.status.location === "reserves") {
-      beginDeployInteraction(state, uiState, unit.id); rerender();
-    }
-    if (evt.key === "h" && unit.status.location === "battlefield" && !state.activatingUnitId) {
-      const result = store.dispatch({ type: "HOLD_UNIT", payload: { playerId: "playerA", unitId: unit.id } });
+    if (state.activePlayer !== "playerA" || !ch || ch.owner !== "playerA") return;
+    if (evt.key === "m" && !ch.movementUsed) { beginMoveInteraction(state, uiState, ch.id); rerender(); }
+    if (evt.key === "r" && !ch.movementUsed && !ch.actionUsed) { beginRunInteraction(state, uiState, ch.id); rerender(); }
+    if (evt.key === "h" && !state.activatingCharacterId) {
+      const result = store.dispatch({ type: "HOLD", payload: { playerId: "playerA", charId: ch.id } });
       if (!result.ok) showError(result.message);
-      else { autoSelectNextUnit(); rerender(); }
-    }
-    if (evt.key === "r" && unit.status.location === "battlefield" && !unit.status.engaged && !unit.status.movementUsed && !unit.status.actionUsed) {
-      beginRunInteraction(state, uiState, unit.id); rerender();
+      else { autoSelectNextCharacter(); rerender(); }
     }
   });
 }
@@ -700,14 +564,15 @@ function wireKeyboardShortcuts() {
 function init() {
   store = createStore(buildInitialState());
   bindInputHandlers(store, controller());
-  document.getElementById("gridModeBtn").textContent = `Grid: ${store.getState().rules.gridMode ? "On" : "Off"}`;
+  const gridBtn = document.getElementById("gridModeBtn");
+  if (gridBtn) gridBtn.textContent = "Grid: On";
   uiState.lastSeenLogCount = store.getState().log.length;
   store.subscribe((state) => {
     publishLogNotifications(state);
     rerender();
     maybeRunBot();
   });
-  autoSelectNextUnit();
+  autoSelectNextCharacter();
   rerender();
   wirePreviewEvents();
   wireKeyboardShortcuts();

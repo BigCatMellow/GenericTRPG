@@ -1,5 +1,7 @@
+// v0.12 Board renderer
 import { getObjectiveControlSnapshot } from "../engine/objectives.js";
 import { gridDistance } from "../engine/geometry.js";
+import { hasCondition, isOverwhelmed } from "../engine/conditions.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 function el(name, attrs = {}) {
@@ -8,31 +10,33 @@ function el(name, attrs = {}) {
   return e;
 }
 function ownerClass(pid) { return pid === "playerA" ? "playerA" : "playerB"; }
-function aliveCount(unit) { return unit.modelIds.filter(id => unit.models[id].alive).length; }
 function sqTopLeft(cx, cy) { return { sx: Math.floor(cx), sy: Math.floor(cy) }; }
 
-/* ═══ Board layers ═══ */
-
 function addGrid(svg, w, h) {
-  for (let x = 0; x <= w; x++) svg.appendChild(el("line", { x1: x, y1: 0, x2: x, y2: h, class: x === w / 2 ? "board-centerline" : "board-grid-line" }));
-  for (let y = 0; y <= h; y++) svg.appendChild(el("line", { x1: 0, y1: y, x2: w, y2: y, class: y === h / 2 ? "board-centerline" : "board-grid-line" }));
-}
-
-function addZones(svg, state) {
-  const d = state.deployment.zoneOfInfluenceDepth;
-  svg.append(
-    el("rect", { x: 0, y: 0, width: d, height: state.board.heightInches, class: "edge-zone playerA" }),
-    el("rect", { x: state.board.widthInches - d, y: 0, width: d, height: state.board.heightInches, class: "edge-zone playerB" })
-  );
+  for (let x = 0; x <= w; x++)
+    svg.appendChild(el("line", { x1: x, y1: 0, x2: x, y2: h, class: x === w / 2 ? "board-centerline" : "board-grid-line" }));
+  for (let y = 0; y <= h; y++)
+    svg.appendChild(el("line", { x1: 0, y1: y, x2: w, y2: y, class: y === h / 2 ? "board-centerline" : "board-grid-line" }));
 }
 
 function addTerrain(svg, terrain) {
-  for (const p of terrain) {
+  for (const t of terrain) {
+    if (!t.rect) continue;
+    let cls = "terrain-cover";
+    if (t.impassable || (t.traits ?? []).includes("blocking")) cls = "terrain-block";
+    else if ((t.traits ?? []).includes("difficult")) cls = "terrain-difficult";
     svg.appendChild(el("rect", {
-      x: p.rect.minX, y: p.rect.minY,
-      width: p.rect.maxX - p.rect.minX, height: p.rect.maxY - p.rect.minY,
-      class: p.impassable ? "terrain-block" : "terrain-cover"
+      x: t.rect.minX, y: t.rect.minY,
+      width: t.rect.maxX - t.rect.minX,
+      height: t.rect.maxY - t.rect.minY,
+      class: cls
     }));
+    // Terrain label
+    const tx = (t.rect.minX + t.rect.maxX) / 2;
+    const ty = (t.rect.minY + t.rect.maxY) / 2;
+    const tl = el("text", { x: tx, y: ty, class: "terrain-label" });
+    tl.textContent = (t.traits?.[0] ?? t.kind ?? "")[0]?.toUpperCase() ?? "";
+    svg.appendChild(tl);
   }
 }
 
@@ -44,9 +48,10 @@ function addObjectives(svg, objectives, snapshot) {
     if (r?.controller === "playerA") cls = "obj-square ctrl-a";
     if (r?.controller === "playerB") cls = "obj-square ctrl-b";
     const ox = Math.floor(obj.x), oy = Math.floor(obj.y);
-    for (let dx = -2; dx <= 2; dx++) {
-      for (let dy = -2; dy <= 2; dy++) {
-        if (Math.max(Math.abs(dx), Math.abs(dy)) <= 2) {
+    // Objective zone (3" radius)
+    for (let dx = -3; dx <= 3; dx++) {
+      for (let dy = -3; dy <= 3; dy++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) <= 3) {
           svg.appendChild(el("rect", { x: ox + dx, y: oy + dy, width: 1, height: 1, class: "obj-zone" }));
         }
       }
@@ -65,47 +70,48 @@ function addPathPreview(svg, preview) {
   if (cost <= 0) return;
   svg.appendChild(el("line", { x1: s.x, y1: s.y, x2: e.x, y2: e.y, class: "path-preview" }));
   const label = el("text", { x: (s.x + e.x) / 2, y: (s.y + e.y) / 2 - 0.4, class: "path-preview-label" });
-  label.textContent = `${Math.round(cost)} sq`;
+  label.textContent = `${Math.round(cost)}"`;
   svg.appendChild(label);
 }
 
 function addPreviewUnit(svg, state, uiState) {
   if (!uiState.previewUnit) return;
-  const { leader } = uiState.previewUnit;
-  const { sx, sy } = sqTopLeft(leader.x, leader.y);
+  const { dest } = uiState.previewUnit;
+  if (!dest) return;
+  const { sx, sy } = sqTopLeft(dest.x, dest.y);
   svg.appendChild(el("rect", { x: sx, y: sy, width: 1, height: 1, class: "deploy-preview" }));
 }
 
-/* ═══ Range squares (Chebyshev grid) ═══ */
 function addRangeSquares(svg, state, uiState) {
-  if (!uiState.selectedUnitId) return;
-  const unit = state.units[uiState.selectedUnitId];
-  if (!unit || unit.owner !== "playerA" || unit.status.location !== "battlefield") return;
-  const leader = unit.models[unit.leadingModelId];
-  if (!leader || leader.x == null) return;
-
-  const ux = leader.x, uy = leader.y;
+  const selId = uiState.selectedCharId;
+  if (!selId) return;
+  const ch = state.characters[selId];
+  if (!ch || ch.owner !== "playerA" || ch.x == null) return;
+  const ux = ch.x, uy = ch.y;
   const bw = state.board.widthInches, bh = state.board.heightInches;
-
   let range = 0, cssClass = "";
-  if (uiState.mode === "move" || uiState.mode === "disengage" || uiState.mode === "deploy") {
-    range = unit.speed; cssClass = "range-sq move";
+
+  if (uiState.mode === "move") {
+    range = ch.move; cssClass = "range-sq move";
   } else if (uiState.mode === "run") {
-    range = unit.speed + 2; cssClass = "range-sq move";
-  } else if (uiState.mode === "declare_ranged" && unit.rangedWeapons?.length) {
-    range = Math.max(...unit.rangedWeapons.map(w => w.rangeInches ?? 0)); cssClass = "range-sq attack";
-  } else if (uiState.mode === "declare_charge") {
-    range = 8; cssClass = "range-sq charge";
+    range = 9; cssClass = "range-sq move";
+  } else if (uiState.mode === "attack") {
+    const atk = ch.attacks?.[uiState.pendingAttackKey];
+    range = atk?.type === "melee" ? 1.5 : (atk?.range ?? 8);
+    cssClass = "range-sq attack";
+  } else if (uiState.mode === "class_ability") {
+    if (ch.classId === "cleric") { range = 6; cssClass = "range-sq friendly"; }
+    if (ch.classId === "mage") { range = 8; cssClass = "range-sq attack"; }
   }
   if (range <= 0 || !cssClass) return;
 
   const g = el("g", { class: "range-overlay" });
-  for (let dx = -range; dx <= range; dx++) {
-    for (let dy = -range; dy <= range; dy++) {
+  for (let dx = -Math.ceil(range); dx <= Math.ceil(range); dx++) {
+    for (let dy = -Math.ceil(range); dy <= Math.ceil(range); dy++) {
       if (Math.max(Math.abs(dx), Math.abs(dy)) > range) continue;
       const px = ux + dx, py = uy + dy;
       if (px < 0.5 || py < 0.5 || px >= bw || py >= bh) continue;
-      if (dx === 0 && dy === 0 && cssClass.includes("move")) continue;
+      if (dx === 0 && dy === 0) continue;
       const { sx, sy } = sqTopLeft(px, py);
       g.appendChild(el("rect", { x: sx, y: sy, width: 1, height: 1, class: cssClass }));
     }
@@ -114,24 +120,34 @@ function addRangeSquares(svg, state, uiState) {
 }
 
 function addTargetHighlights(svg, state, uiState) {
-  if (!uiState.selectedUnitId) return;
-  if (uiState.mode !== "declare_ranged" && uiState.mode !== "declare_charge") return;
-  const unit = state.units[uiState.selectedUnitId];
-  if (!unit || unit.owner !== "playerA" || unit.status.location !== "battlefield") return;
-  const leader = unit.models[unit.leadingModelId];
-  if (!leader || leader.x == null) return;
+  const selId = uiState.selectedCharId;
+  if (!selId) return;
+  if (uiState.mode !== "attack" && uiState.mode !== "class_ability") return;
+  const ch = state.characters[selId];
+  if (!ch || ch.x == null) return;
+  const isClassAbility = uiState.mode === "class_ability";
+  const abilityId = uiState.pendingAbilityId;
 
-  for (const t of Object.values(state.units)) {
-    if (t.owner !== "playerB" || t.status.location !== "battlefield") continue;
-    const tl = t.models[t.leadingModelId];
-    if (!tl || tl.x == null) continue;
-    const dist = gridDistance(leader, tl);
-    let inRange = false;
-    if (uiState.mode === "declare_ranged" && unit.rangedWeapons?.length)
-      inRange = dist <= Math.max(...unit.rangedWeapons.map(w => w.rangeInches ?? 0));
-    if (uiState.mode === "declare_charge") inRange = dist <= 8;
-    if (inRange) {
-      const { sx, sy } = sqTopLeft(tl.x, tl.y);
+  for (const t of Object.values(state.characters)) {
+    if (t.health <= 0 || t.x == null) continue;
+    let eligible = false;
+    if (isClassAbility) {
+      // Rally: friendly within 6"; Disrupt: enemy within 8"
+      if (abilityId === "rally" && t.owner === ch.owner && t.id !== ch.id) {
+        eligible = gridDistance({ x: ch.x, y: ch.y }, { x: t.x, y: t.y }) <= 6;
+      }
+      if (abilityId === "disrupt" && t.owner !== ch.owner) {
+        eligible = gridDistance({ x: ch.x, y: ch.y }, { x: t.x, y: t.y }) <= 8;
+      }
+    } else {
+      // Attack target
+      if (t.owner === ch.owner) continue;
+      const atk = ch.attacks?.[uiState.pendingAttackKey];
+      const range = atk?.type === "melee" ? 1.5 : (atk?.range ?? 8);
+      eligible = gridDistance({ x: ch.x, y: ch.y }, { x: t.x, y: t.y }) <= range;
+    }
+    if (eligible) {
+      const { sx, sy } = sqTopLeft(t.x, t.y);
       svg.appendChild(el("rect", { x: sx, y: sy, width: 1, height: 1, class: "target-sq" }));
     }
   }
@@ -139,87 +155,110 @@ function addTargetHighlights(svg, state, uiState) {
 
 function addActivationIndicators(svg, state) {
   if (state.activePlayer !== "playerA") return;
-  for (const unit of Object.values(state.units)) {
-    if (unit.owner !== "playerA" || unit.status.location !== "battlefield") continue;
-    const m = unit.models[unit.leadingModelId];
-    if (!m || m.x == null) continue;
-    if (!unit.status.activatedThisRound) {
-      const { sx, sy } = sqTopLeft(m.x, m.y);
+  for (const ch of Object.values(state.characters)) {
+    if (ch.owner !== "playerA" || ch.x == null || ch.health <= 0) continue;
+    if (!ch.activatedThisRound) {
+      const { sx, sy } = sqTopLeft(ch.x, ch.y);
       svg.appendChild(el("rect", { x: sx, y: sy, width: 1, height: 1, class: "needs-activation-sq" }));
     }
   }
 }
 
 function addActivatingHighlight(svg, state) {
-  if (!state.activatingUnitId) return;
-  const unit = state.units[state.activatingUnitId];
-  if (!unit) return;
-  const m = unit.models[unit.leadingModelId];
-  if (!m || m.x == null) return;
-  const { sx, sy } = sqTopLeft(m.x, m.y);
+  if (!state.activatingCharacterId) return;
+  const ch = state.characters[state.activatingCharacterId];
+  if (!ch || ch.x == null) return;
+  const { sx, sy } = sqTopLeft(ch.x, ch.y);
   svg.appendChild(el("rect", { x: sx, y: sy, width: 1, height: 1, class: "activating-sq" }));
 }
 
-/* ═══ Single-block unit rendering ═══ */
 function abbreviate(name) {
-  if (name.length <= 10) return name;
+  if (name.length <= 8) return name;
   const w = name.split(/[\s_-]+/);
-  if (w.length === 1) return name.slice(0, 9);
-  return w.map(x => x[0]).join("").toUpperCase();
+  return w.length > 1 ? w.map(x => x[0]).join("").toUpperCase() : name.slice(0, 7);
 }
 
-function addUnits(svg, state, uiState, onModelClick) {
-  for (const unit of Object.values(state.units)) {
-    if (unit.status.location !== "battlefield") continue;
-    const leader = unit.models[unit.leadingModelId];
-    if (!leader?.alive || leader.x == null) continue;
-    const cx = leader.x, cy = leader.y;
-    const al = aliveCount(unit);
-    const owner = ownerClass(unit.owner);
-    const isSelected = uiState.selectedUnitId === unit.id;
-    const isActivating = state.activatingUnitId === unit.id;
-    const activated = unit.status.activatedThisRound;
-    const { sx, sy } = sqTopLeft(cx, cy);
+function conditionBadge(ch) {
+  const badges = [];
+  if (hasCondition(ch, "guarded")) badges.push("G");
+  if (hasCondition(ch, "pinned")) badges.push("P");
+  if (hasCondition(ch, "exposed")) badges.push("E");
+  if (isOverwhelmed(ch)) badges.push("OVR");
+  return badges.join("");
+}
 
-    // Single colored block
+function readinessBadge(ch) {
+  if (ch.readiness === "ready") return "R";
+  if (ch.readiness === "committed") return "C";
+  if (ch.readiness === "spent") return "S";
+  return "";
+}
+
+function addUnits(svg, state, uiState, onCharClick) {
+  for (const ch of Object.values(state.characters)) {
+    if (ch.x == null || ch.health <= 0) continue;
+    const owner = ownerClass(ch.owner);
+    const isSelected = uiState.selectedCharId === ch.id;
+    const isActivating = state.activatingCharacterId === ch.id;
+    const activated = ch.activatedThisRound;
+    const { sx, sy } = sqTopLeft(ch.x, ch.y);
+
     const cls = ["unit-block", owner];
     if (activated) cls.push("activated");
     if (isActivating) cls.push("activating");
     else if (isSelected) cls.push("selected");
+    if (ch.readiness === "spent") cls.push("spent");
+    if (hasCondition(ch, "pinned")) cls.push("pinned");
+    if (hasCondition(ch, "exposed")) cls.push("exposed");
+
     const block = el("rect", {
       x: sx + 0.05, y: sy + 0.05, width: 0.9, height: 0.9,
       rx: 0.08, ry: 0.08,
       class: cls.join(" "),
-      "data-unit-id": unit.id
+      "data-char-id": ch.id
     });
     block.addEventListener("click", evt => {
       evt.stopPropagation();
-      onModelClick(unit.id, unit.leadingModelId);
+      onCharClick(ch.id);
     });
     svg.appendChild(block);
 
+    // Health bar
+    const hpPct = ch.health / ch.maxHealth;
+    const barW = 0.8 * hpPct;
+    const barColor = hpPct > 0.6 ? "var(--green)" : hpPct > 0.3 ? "var(--warn)" : "var(--red)";
+    svg.appendChild(el("rect", { x: sx + 0.1, y: sy + 0.82, width: 0.8, height: 0.08, fill: "rgba(0,0,0,0.3)" }));
+    svg.appendChild(el("rect", { x: sx + 0.1, y: sy + 0.82, width: barW, height: 0.08, fill: barColor, style: "pointer-events:none" }));
+
     // Tooltip
     const title = el("title");
-    const wpn = unit.rangedWeapons?.length
-      ? unit.rangedWeapons.map(w => `${w.name} ${w.rangeInches}" ${w.hitTarget}+`).join(", ")
-      : unit.meleeWeapons?.length ? unit.meleeWeapons.map(w => `${w.name} ${w.hitTarget}+`).join(", ") : "";
-    title.textContent = `${unit.name}\n${al} models, ${unit.currentSupplyValue} cost, Spd ${unit.speed}\n${wpn}`;
+    const conds = ch.conditions.join("/") || "none";
+    title.textContent = `${ch.name} [${ch.classId}]\nHP:${ch.health}/${ch.maxHealth} ${ch.readiness}\nConditions: ${conds}`;
     block.appendChild(title);
 
-    // Name above the block
+    // Class abbreviation and name above block
     const nameText = el("text", { x: sx + 0.5, y: sy - 0.08, class: `unit-label ${owner}` });
-    nameText.textContent = abbreviate(unit.name);
+    nameText.textContent = abbreviate(ch.name);
     svg.appendChild(nameText);
 
-    // Stats inside the block
-    const infoText = el("text", { x: sx + 0.5, y: sy + 0.55, class: "unit-info-text" });
-    infoText.textContent = `${al} · ${unit.currentSupplyValue}`;
-    svg.appendChild(infoText);
+    // Stats inside block
+    const hpText = el("text", { x: sx + 0.5, y: sy + 0.48, class: "unit-info-text" });
+    hpText.textContent = `${ch.health}/${ch.maxHealth}`;
+    svg.appendChild(hpText);
 
-    if (unit.status.engaged) {
-      const badge = el("text", { x: sx + 0.5, y: sy + 1.18, class: "unit-engaged-badge" });
-      badge.textContent = "ENGAGED";
-      svg.appendChild(badge);
+    // Readiness/condition badge
+    const badge = readinessBadge(ch) + conditionBadge(ch);
+    if (badge) {
+      const badgeText = el("text", { x: sx + 0.5, y: sy + 0.73, class: `unit-badge ${owner}` });
+      badgeText.textContent = badge;
+      svg.appendChild(badgeText);
+    }
+
+    // Securing indicator
+    if (ch.securingObjectiveId) {
+      const secText = el("text", { x: sx + 0.5, y: sy + 1.15, class: "unit-securing-badge" });
+      secText.textContent = "SECURING";
+      svg.appendChild(secText);
     }
   }
 }
@@ -228,12 +267,9 @@ export function screenToBoardPoint(svg, clientX, clientY) {
   const pt = svg.createSVGPoint();
   pt.x = clientX; pt.y = clientY;
   const t = pt.matrixTransform(svg.getScreenCTM().inverse());
-  const w = Number(svg.dataset.boardWidth ?? 36), h = Number(svg.dataset.boardHeight ?? 36);
+  const w = Number(svg.dataset.boardWidth ?? 24), h = Number(svg.dataset.boardHeight ?? 24);
   return { x: Math.max(0, Math.min(w, t.x)), y: Math.max(0, Math.min(h, t.y)) };
 }
-
-export function renderLegalOverlay() {}
-export function renderUnitGhost() {}
 
 export function renderBoard(state, uiState, handlers) {
   const svg = document.getElementById("battlefield");
@@ -241,19 +277,19 @@ export function renderBoard(state, uiState, handlers) {
   svg.dataset.boardWidth = String(state.board.widthInches);
   svg.dataset.boardHeight = String(state.board.heightInches);
   svg.innerHTML = "";
+
   const ctrlSnap = getObjectiveControlSnapshot(state);
 
-  addZones(svg, state);
   addGrid(svg, state.board.widthInches, state.board.heightInches);
   addTerrain(svg, state.board.terrain);
-  addObjectives(svg, state.deployment.missionMarkers, ctrlSnap);
+  addObjectives(svg, state.board.objectives, ctrlSnap);
   addActivationIndicators(svg, state);
   addActivatingHighlight(svg, state);
   addRangeSquares(svg, state, uiState);
   addTargetHighlights(svg, state, uiState);
   addPathPreview(svg, uiState.previewPath);
   addPreviewUnit(svg, state, uiState);
-  addUnits(svg, state, uiState, handlers.onModelClick);
+  addUnits(svg, state, uiState, handlers.onCharClick);
 
   svg.onclick = event => {
     const point = screenToBoardPoint(svg, event.clientX, event.clientY);

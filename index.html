@@ -4,14 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#1a2636" />
-  <title>Skirmish — Crown vs Reavers</title>
+  <title>GenericTRPG v0.12 — Skirmish</title>
   <link rel="stylesheet" href="./css/styles.css" />
 </head>
 <body>
   <div class="app">
     <!-- HUD: top bar overlay -->
     <div class="hud-top">
-      <div id="turnChip" class="hud-chip blue">Crown</div>
+      <div id="turnChip" class="hud-chip blue">Player A</div>
       <div id="phaseChip" class="hud-phase">Round 1</div>
       <div class="hud-score"><span class="sc blue" id="vpA">0</span><span class="sc-sep">:</span><span class="sc red" id="vpB">0</span></div>
       <div id="roundChip" class="hud-round">R1/5</div>
@@ -20,15 +20,15 @@
 
     <!-- BOARD: fills the viewport -->
     <div class="board-fill">
-      <svg id="battlefield" viewBox="0 0 36 36" preserveAspectRatio="xMidYMid meet"></svg>
+      <svg id="battlefield" viewBox="0 0 24 24" preserveAspectRatio="xMidYMid meet"></svg>
     </div>
 
     <!-- MODE HINT: one-line above action bar -->
-    <div class="mode-strip" id="modeHint">Select a unit to begin.</div>
+    <div class="mode-strip" id="modeHint">Select a character to begin.</div>
 
     <!-- ACTION BAR: pinned to bottom -->
     <div class="action-bar">
-      <div class="ab-unit" id="abUnit">No unit selected</div>
+      <div class="ab-unit" id="abUnit">No character selected</div>
       <div class="ab-buttons" id="actionButtons"></div>
       <button class="ab-pass" id="passBtn">Pass Round</button>
     </div>
@@ -38,32 +38,36 @@
       <button class="drawer-close" id="drawerClose" title="Close panel" aria-label="Close panel">✕</button>
       <div class="drawer-scroll">
         <section class="d-section">
-          <div class="d-title">Selected Unit</div>
-          <div id="selectedUnitPanel" class="d-empty">Tap a unit</div>
+          <div class="d-title">Selected Character</div>
+          <div id="selectedUnitPanel" class="d-empty">Select a character</div>
         </section>
         <section class="d-section">
-          <div class="d-title">Battle</div>
-          <div class="d-row"><span>Force</span><span id="supplyText">0/4 vs 0/4</span></div>
+          <div class="d-title">Objectives</div>
           <div id="objectiveControl" class="d-list"></div>
         </section>
         <section class="d-section">
-          <div class="d-title">Your Warband</div>
+          <div class="d-title">Your Warband (A)</div>
           <div id="phaseChecklist" class="d-checklist"></div>
-          <div id="playerReserves" class="d-unit-list"></div>
           <div id="playerBattlefield" class="d-unit-list"></div>
         </section>
         <section class="d-section">
-          <div class="d-title">Tactical Cards</div>
-          <div id="tacticalCards" class="d-list"></div>
-        </section>
-        <section class="d-section">
-          <div class="d-title">Enemy</div>
+          <div class="d-title">Enemy Warband (B)</div>
           <div id="enemyBattlefield" class="d-unit-list"></div>
-          <div id="enemyReserves" class="d-unit-list"></div>
         </section>
         <section class="d-section">
           <div class="d-title">Battle Log</div>
           <div id="logPanel" class="d-log"></div>
+        </section>
+        <section class="d-section">
+          <div class="d-title">Rules Quick Reference</div>
+          <div class="d-qref">
+            <div class="qr-line"><strong>Readiness:</strong> Ready → Committed → Spent</div>
+            <div class="qr-line"><strong>Conditions:</strong> G=Guarded P=Pinned E=Exposed OVR=Overwhelmed</div>
+            <div class="qr-line"><strong>Attacks:</strong> Quick(1dmg) Standard(2dmg) Heavy(3dmg)</div>
+            <div class="qr-line"><strong>Dodge:</strong> 4+ miss; Quick=5+ Heavy=3+; Pinned +1; Committed +1</div>
+            <div class="qr-line"><strong>Brace:</strong> 4+ reduce dmg 1; Guarded reduce 2; Crit reduce extra 1</div>
+            <div class="qr-line"><strong>Scoring:</strong> From R2, control obj for 1VP. First to 3VP wins.</div>
+          </div>
         </section>
         <section class="d-section">
           <div class="d-row">

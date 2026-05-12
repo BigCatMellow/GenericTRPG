@@ -1,24 +1,20 @@
+// v0.12 Deployments — 24x24 board, center objective
+
 export const DEPLOYMENT_DATA = {
-  valley: {
-    id: "valley",
-    name: "Valley Engagement",
-    boardWidthInches: 36,
-    boardHeightInches: 36,
-    entryEdges: {
-      playerA: { side: "west" },
-      playerB: { side: "east" }
-    },
-    zoneOfInfluenceDepth: 6,
+  standard: {
+    id: "standard",
+    name: "Standard Skirmish",
+    boardWidthInches: 24,
+    boardHeightInches: 24,
     missionMarkers: [
-      { id: "obj1", x: 18, y: 18 },
-      { id: "obj2", x: 18, y: 10 },
-      { id: "obj3", x: 18, y: 26 }
+      { id: "obj1", x: 12, y: 12 },
+      { id: "obj2", x: 8, y: 8 },
+      { id: "obj3", x: 16, y: 16 }
     ]
   }
 };
 
 export function getDeployment(deploymentId) {
-  const deployment = DEPLOYMENT_DATA[deploymentId];
-  if (!deployment) throw new Error(`Unknown deployment: ${deploymentId}`);
+  const deployment = DEPLOYMENT_DATA[deploymentId] ?? DEPLOYMENT_DATA.standard;
   return deployment;
 }

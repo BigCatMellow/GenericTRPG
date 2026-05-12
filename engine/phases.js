@@ -1,91 +1,92 @@
-import { appendLog } from "./state.js";
-import { refreshAllSupply } from "./supply.js";
-import { determineWinner } from "./objectives.js";
-import { checkMissionInstantWin, resolveMissionScoringAtCleanup } from "./mission_rules.js";
-import { onRoundStart } from "./effects.js";
+// v0.12 Round phases
 
-function formatPlayer(playerId) {
-  if (!playerId) return "No one";
-  return playerId === "playerA" ? "Crown Levy" : "Border Reavers";
-}
+import { appendLog } from "./state.js";
+import { endRoundReadinessCleanup } from "./readiness.js";
+import { scoreObjectivesForRound, determineWinner } from "./objectives.js";
+import { hasCondition, removeCondition } from "./conditions.js";
 
 function getOpponent(playerId) {
   return playerId === "playerA" ? "playerB" : "playerA";
 }
 
+function formatPlayer(pid) {
+  return pid === "playerA" ? "Player A" : "Player B";
+}
+
 function logObjectiveScoring(state, scoring) {
-  const objectiveSummaries = Object.values(scoring.snapshot).map(result => {
-    if (!result.controller) {
-      if (result.contested) return `${result.objectiveId}: contested (${result.playerASupply}-${result.playerBSupply})`;
-      return `${result.objectiveId}: uncontrolled`;
-    }
-    return `${result.objectiveId}: ${formatPlayer(result.controller)} controls (${result.playerASupply}-${result.playerBSupply})`;
+  if (scoring.skipped) {
+    appendLog(state, "score", `Round 1 — no objectives scored yet.`);
+    return;
+  }
+  const parts = Object.values(scoring.snapshot).map(r => {
+    if (!r.controller && !r.contested) return `${r.objectiveId}: uncontrolled`;
+    if (r.contested) return `${r.objectiveId}: contested (A:${r.playerACount} B:${r.playerBCount})`;
+    return `${r.objectiveId}: ${formatPlayer(r.controller)} controls (A:${r.playerACount} B:${r.playerBCount})`;
   });
   appendLog(state, "score",
-    `Round ${state.round} objectives — ${objectiveSummaries.join(" | ")}`);
-  appendLog(state, "score",
-    `VP this round — Crown ${scoring.gained.playerA}, Reavers ${scoring.gained.playerB}. Totals — Crown ${state.players.playerA.vp}, Reavers ${state.players.playerB.vp}.`);
+    `Round ${state.round} scoring — ${parts.join(" | ")}. VP: A=${state.players.playerA.vp} B=${state.players.playerB.vp}.`);
 }
 
-export function beginGame(state) {
-  refreshAllSupply(state);
-  appendLog(state, "info", "Both warbands begin off-table. Deploy units as you activate them.");
-  return { ok: true, state, events: [] };
-}
-
-/** Reset per-round flags and start a new round of activations. */
 export function beginRound(state) {
-  for (const unit of Object.values(state.units)) {
-    unit.status.activatedThisRound = false;
-    unit.status.movementUsed = false;
-    unit.status.actionUsed = false;
-    unit.status.runThisActivation = false;
+  // Reset per-round flags for all characters
+  for (const ch of Object.values(state.characters)) {
+    ch.activatedThisRound = false;
+    ch.movementUsed = false;
+    ch.actionUsed = false;
+    ch.ranThisActivation = false;
+    // Guarded clears at start of next activation (tracked separately)
+    // Securing breaks if applicable — checked during activation
   }
   state.players.playerA.passedThisRound = false;
   state.players.playerB.passedThisRound = false;
-  state.activatingUnitId = null;
+  state.activatingCharacterId = null;
   state.activePlayer = state.firstPlayerThisRound;
-  onRoundStart(state);
-  refreshAllSupply(state);
   state.phase = "battle";
-  appendLog(state, "phase", `Round ${state.round} — ${formatPlayer(state.activePlayer)} activate first.`);
+
+  appendLog(state, "phase", `Round ${state.round} begins. ${formatPlayer(state.activePlayer)} activates first.`);
   return { ok: true, state, events: [] };
 }
 
-/**
- * Called when both sides are out of activations. Score, check win, advance round.
- */
 export function endRound(state) {
   state.phase = "cleanup";
-  const scoring = resolveMissionScoringAtCleanup(state);
+
+  // Score objectives (skipped if round 1)
+  const scoring = scoreObjectivesForRound(state);
   logObjectiveScoring(state, scoring);
-  state.lastRoundSummary = {
-    round: state.round,
-    scoring,
-    combatEvents: state.lastCombatReport ?? []
-  };
-  state.lastCombatReport = [];
 
-  const instantWin = checkMissionInstantWin(state, scoring);
-  if (instantWin) {
-    state.winner = instantWin.winner;
-    appendLog(state, "phase", `Decisive victory: ${instantWin.reason}`);
-    return { ok: true, state, events: [{ type: "game_completed", payload: { winner: state.winner, reason: instantWin.reason } }] };
+  // Check for winner
+  const winner = determineWinner(state);
+  if (winner) {
+    state.winner = winner;
+    appendLog(state, "phase", `${formatPlayer(winner)} wins!`);
+    return { ok: true, state, events: [{ type: "game_completed", payload: { winner } }] };
   }
 
-  const roundLimit = state.mission.pacing?.roundLimit ?? state.mission.roundLimit;
-  if (state.round >= roundLimit) {
-    state.winner = determineWinner(state);
-    if (state.winner) {
-      appendLog(state, "phase", `Final round reached. ${formatPlayer(state.winner)} win on VP.`);
-    } else {
-      appendLog(state, "phase", "Final round reached. The battle ends in a draw.");
-    }
-    return { ok: true, state, events: [{ type: "game_completed", payload: { winner: state.winner } }] };
+  // Check round limit (draw after 5)
+  if (state.round >= 5) {
+    state.winner = null;
+    appendLog(state, "phase", "Round 5 complete. Game ends in a draw.");
+    return { ok: true, state, events: [{ type: "game_completed", payload: { winner: null } }] };
   }
 
-  // Initiative alternates each round
+  // Readiness cleanup for all living characters
+  for (const ch of Object.values(state.characters)) {
+    if (ch.health <= 0) continue;
+    endRoundReadinessCleanup(ch);
+
+    // Break securing at start of next round if conditions met
+    // (Pinned/Exposed already handled when applied; Spent does NOT break securing)
+    // Characters that start a new activation while securing will have it checked then.
+  }
+
+  // Alternate first player
   state.firstPlayerThisRound = getOpponent(state.firstPlayerThisRound);
   state.round += 1;
+
   return beginRound(state);
+}
+
+export function beginGame(state) {
+  appendLog(state, "info", "Game begins! Round 1. Characters start on the battlefield.");
+  return { ok: true, state, events: [] };
 }

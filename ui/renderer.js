@@ -1,18 +1,23 @@
+// v0.12 Renderer
 import { renderBoard } from "./board.js";
 import { getObjectiveControlSnapshot } from "../engine/objectives.js";
-import { getTacticalCard } from "../data/tactical_cards.js";
+import { hasCondition, isOverwhelmed } from "../engine/conditions.js";
 
-function pn(id) { return id === "playerA" ? "Crown" : "Reavers"; }
+function pn(id) { return id === "playerA" ? "Player A" : "Player B"; }
 function tc(s) { return String(s).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase()); }
-function al(u) { return u.modelIds.filter(id => u.models[id].alive).length; }
-function fmtCost(p) { return p === Infinity ? "∞" : String(p); }
-function force(state, pid) {
-  return state.players[pid].battlefieldUnitIds.reduce((t, id) => t + state.units[id].currentSupplyValue, 0);
+function hpBar(ch) { return `${ch.health}/${ch.maxHealth}`; }
+
+function conditionText(ch) {
+  const parts = [];
+  if (hasCondition(ch, "guarded")) parts.push("Guarded");
+  if (hasCondition(ch, "pinned")) parts.push("Pinned");
+  if (hasCondition(ch, "exposed")) parts.push("Exposed");
+  if (isOverwhelmed(ch)) parts.push("OVERWHELMED");
+  return parts.join(", ") || "—";
 }
 
 export function renderAll(state, uiState, handlers) {
   const actionBtns = typeof handlers.buildActionButtons === "function" ? handlers.buildActionButtons() : [];
-  const cardBtns = typeof handlers.buildCardButtons === "function" ? handlers.buildCardButtons() : [];
 
   // HUD
   const chip = document.getElementById("turnChip");
@@ -20,17 +25,16 @@ export function renderAll(state, uiState, handlers) {
   chip.className = `hud-chip ${state.activePlayer === "playerA" ? "blue" : "red"}`;
 
   const phase = document.getElementById("phaseChip");
-  if (state.activatingUnitId) {
-    const u = state.units[state.activatingUnitId];
-    phase.textContent = `${u?.name ?? "Unit"} acting`;
+  if (state.activatingCharacterId) {
+    const ch = state.characters[state.activatingCharacterId];
+    phase.textContent = `${ch?.name ?? "?"} acting`;
   } else {
-    phase.textContent = state.phase === "battle" ? "Choose a unit" : tc(state.phase);
+    phase.textContent = state.phase === "battle" ? "Choose a character" : tc(state.phase);
   }
 
   document.getElementById("vpA").textContent = state.players.playerA.vp;
   document.getElementById("vpB").textContent = state.players.playerB.vp;
-  const rl = state.mission.pacing?.roundLimit ?? state.mission.roundLimit ?? 5;
-  document.getElementById("roundChip").textContent = `R${state.round}/${rl}`;
+  document.getElementById("roundChip").textContent = `R${state.round}/5`;
 
   // Mode hint
   const hint = document.getElementById("modeHint");
@@ -40,17 +44,19 @@ export function renderAll(state, uiState, handlers) {
   else if (uiState.mode) hint.classList.add("active");
   else if (uiState.locked) hint.classList.add("locked");
 
-  // Action bar — selected/activating unit
-  const showUnitId = state.activatingUnitId ?? uiState.selectedUnitId;
-  const unit = showUnitId ? state.units[showUnitId] : null;
+  // Action bar — selected/activating character
+  const showId = state.activatingCharacterId ?? uiState.selectedCharId;
+  const ch = showId ? state.characters[showId] : null;
   const abUnit = document.getElementById("abUnit");
-  if (unit) {
-    const wpn = unit.rangedWeapons?.[0] ?? unit.meleeWeapons?.[0];
-    const slots = state.activatingUnitId === unit.id
-      ? ` · ${unit.status.movementUsed ? "Mv✓" : "Mv"} ${unit.status.actionUsed ? "Act✓" : "Act"}`
+  if (ch) {
+    const slots = state.activatingCharacterId === ch.id
+      ? ` · ${ch.movementUsed ? "Mv✓" : "Mv"} ${ch.actionUsed ? "Act✓" : "Act"}`
       : "";
-    abUnit.innerHTML = `<strong>${unit.name}</strong> ${unit.currentSupplyValue}C · ${al(unit)}mdl${wpn ? " · " + wpn.name : ""}${slots}`;
-  } else abUnit.textContent = "No unit selected";
+    const conds = ch.conditions.length ? ` · ${ch.conditions.map(c => c[0].toUpperCase()).join("")}` : "";
+    abUnit.innerHTML = `<strong>${ch.name}</strong> [${ch.classId}] HP:${hpBar(ch)} ${tc(ch.readiness)}${conds}${slots}`;
+  } else {
+    abUnit.textContent = "No character selected";
+  }
 
   const abBtns = document.getElementById("actionButtons");
   abBtns.innerHTML = "";
@@ -60,23 +66,20 @@ export function renderAll(state, uiState, handlers) {
   const canPass = state.activePlayer === "playerA"
     && state.phase === "battle"
     && !state.players.playerA.passedThisRound
-    && !state.activatingUnitId;
+    && !state.activatingCharacterId;
   passBtn.disabled = !canPass;
   passBtn.textContent = uiState.pendingPass ? "Confirm Pass" : "Pass Round";
   passBtn.className = uiState.pendingPass ? "ab-pass confirm-flash" : "ab-pass";
-
-  // Drawer: force totals
-  const sEl = document.getElementById("supplyText");
-  if (sEl) sEl.textContent = `${force(state, "playerA")}/${fmtCost(state.players.playerA.supplyPool)} vs ${force(state, "playerB")}/${fmtCost(state.players.playerB.supplyPool)}`;
 
   // Drawer: objectives
   const objEl = document.getElementById("objectiveControl");
   if (objEl) {
     objEl.innerHTML = "";
     const snap = getObjectiveControlSnapshot(state);
-    for (const obj of state.deployment.missionMarkers) {
+    for (const obj of state.board.objectives) {
       const r = snap[obj.id];
-      const ctrl = r.controller ? `${pn(r.controller)} (${r.playerASupply}-${r.playerBSupply})` : r.contested ? "Contested" : "—";
+      const ctrl = r.controller ? `${pn(r.controller)} (A:${r.playerACount} B:${r.playerBCount})`
+        : r.contested ? `Contested (A:${r.playerACount} B:${r.playerBCount})` : "—";
       const d = document.createElement("div");
       d.className = "obj-line";
       d.innerHTML = `<span>${obj.id.toUpperCase()}</span><span>${ctrl}</span>`;
@@ -84,118 +87,75 @@ export function renderAll(state, uiState, handlers) {
     }
   }
 
-  // Drawer: checklist
-  const ck = typeof handlers.getPhaseChecklist === "function" ? handlers.getPhaseChecklist() : null;
-  const ckEl = document.getElementById("phaseChecklist");
-  if (ckEl && ck) {
-    const pct = ck.total > 0 ? Math.round(ck.done / ck.total * 100) : 0;
-    ckEl.innerHTML = `<div class="ck-bar"><div class="ck-fill" style="width:${pct}%"></div></div><div class="ck-label">${ck.done}/${ck.total}</div>` +
-      (ck.remaining.length ? `<div class="ck-remaining">${ck.remaining.map(n => `<span class="ck-unit">${n}</span>`).join("")}</div>` : "");
-  }
+  // Drawer: character lists
+  renderCharacterList("playerBattlefield", "playerA", state, uiState, handlers.onCharSelect);
+  renderCharacterList("enemyBattlefield", "playerB", state, uiState, handlers.onCharSelect);
 
-  renderUnitList("playerReserves", state.players.playerA.reserveUnitIds, state, uiState, handlers.onUnitSelect);
-  renderUnitList("playerBattlefield", state.players.playerA.battlefieldUnitIds, state, uiState, handlers.onUnitSelect);
-  renderUnitList("enemyBattlefield", state.players.playerB.battlefieldUnitIds, state, uiState, handlers.onUnitSelect);
-  renderUnitList("enemyReserves", state.players.playerB.reserveUnitIds, state, uiState, handlers.onUnitSelect);
-
-  renderSelectedUnit(state, uiState);
-  renderCards(state, cardBtns);
+  renderSelectedCharacter(state, uiState);
   renderLog(state);
   renderBoard(state, uiState, handlers);
 }
 
-function renderUnitList(containerId, unitIds, state, uiState, onSelect) {
+function renderCharacterList(containerId, playerId, state, uiState, onSelect) {
   const el = document.getElementById(containerId);
   if (!el) return;
   el.innerHTML = "";
-  if (!unitIds.length) { el.innerHTML = '<div class="d-empty">None</div>'; return; }
-  for (const uid of unitIds) {
-    const u = state.units[uid];
-    if (!u) continue;
-    const act = u.status.activatedThisRound;
-    const own = u.owner === "playerA";
-    const need = own && !act && state.activePlayer === "playerA";
+  const chars = Object.values(state.characters).filter(c => c.owner === playerId);
+  if (!chars.length) { el.innerHTML = '<div class="d-empty">None</div>'; return; }
+  for (const ch of chars) {
+    const act = ch.activatedThisRound;
+    const own = ch.owner === "playerA";
+    const need = own && !act && !ch.activatedThisRound && state.activePlayer === "playerA" && ch.health > 0;
+    const defeated = ch.health <= 0;
     const card = document.createElement("div");
-    card.className = `d-ucard ${uiState.selectedUnitId === u.id ? "selected" : ""} ${need ? "needs-action" : ""} ${act ? "done" : ""}`;
-    card.innerHTML = `<div><div class="d-ucard-name">${u.name}</div><div class="d-ucard-stats">Spd${u.speed} ${al(u)}/${u.modelIds.length}mdl</div></div><div style="font-weight:800">${u.currentSupplyValue}C</div>`;
-    card.addEventListener("click", () => onSelect(u.id));
+    card.className = `d-ucard ${uiState.selectedCharId === ch.id ? "selected" : ""} ${need ? "needs-action" : ""} ${act ? "done" : ""} ${defeated ? "done" : ""}`;
+    const conds = ch.conditions.map(c => c[0].toUpperCase()).join("") || "";
+    card.innerHTML = `<div><div class="d-ucard-name">${ch.name}${defeated ? " ✗" : ""}</div><div class="d-ucard-stats">${ch.classId} · ${ch.readiness[0].toUpperCase()}${conds} · HP:${ch.health}/${ch.maxHealth}</div></div>`;
+    if (onSelect && !defeated) card.addEventListener("click", () => onSelect(ch.id));
     el.appendChild(card);
   }
 }
 
-function renderSelectedUnit(state, uiState) {
+function renderSelectedCharacter(state, uiState) {
   const panel = document.getElementById("selectedUnitPanel");
   if (!panel) return;
-  const u = uiState.selectedUnitId ? state.units[uiState.selectedUnitId] : null;
-  if (!u) { panel.innerHTML = '<div class="d-empty">Tap a unit</div>'; return; }
-  const def = u.defense ?? {};
-  const wpnHtml = (weapons, label) => {
-    if (!weapons?.length) return "";
-    return `<div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-top:6px">${label}</div>` +
-      weapons.map(w => `<div class="su-weapon"><div class="su-weapon-name">${w.name}</div><div class="su-weapon-stats">
-        <div class="su-ws"><span class="su-ws-label">Rng</span><span class="su-ws-val">${w.rangeInches != null ? w.rangeInches : "Mel"}</span></div>
-        <div class="su-ws"><span class="su-ws-label">Atk</span><span class="su-ws-val">${w.attacksPerModel ?? w.shotsPerModel ?? 1}</span></div>
-        <div class="su-ws"><span class="su-ws-label">Hit</span><span class="su-ws-val">${w.hitTarget ?? "?"}+</span></div>
-        <div class="su-ws"><span class="su-ws-label">Dmg</span><span class="su-ws-val">${w.damage ?? 1}</span></div>
-        ${w.armorPenetration ? `<div class="su-ws"><span class="su-ws-label">AP</span><span class="su-ws-val">-${w.armorPenetration}</span></div>` : ""}
-      </div></div>`).join("");
-  };
+  const ch = uiState.selectedCharId ? state.characters[uiState.selectedCharId] : null;
+  if (!ch) { panel.innerHTML = '<div class="d-empty">Select a character</div>'; return; }
+
+  const attackRows = ch.attacks ? Object.entries(ch.attacks).map(([key, atk]) =>
+    `<div class="su-weapon">
+      <div class="su-weapon-name">${atk.name} <span class="badge">${atk.attackType}</span></div>
+      <div class="su-weapon-stats">
+        <div class="su-ws"><span class="su-ws-label">Type</span><span class="su-ws-val">${atk.type}</span></div>
+        <div class="su-ws"><span class="su-ws-label">Dmg</span><span class="su-ws-val">${atk.damage}</span></div>
+        ${atk.range ? `<div class="su-ws"><span class="su-ws-label">Rng</span><span class="su-ws-val">${atk.range}"</span></div>` : ""}
+        ${atk.appliesPinned ? `<div class="su-ws"><span class="su-ws-label">⚑</span><span class="su-ws-val">Pin</span></div>` : ""}
+        ${atk.appliesExposed ? `<div class="su-ws"><span class="su-ws-label">⚑</span><span class="su-ws-val">Exp</span></div>` : ""}
+      </div>
+    </div>`
+  ).join("") : "";
+
   panel.innerHTML = `
-    <div class="su-title">${u.name}</div>
-    ${u.tags?.length ? `<div class="su-tags">${u.tags.join(", ")}</div>` : ""}
+    <div class="su-title">${ch.name} <span class="badge">${ch.classId}</span></div>
     <div class="su-stats">
-      <div class="su-stat"><div class="k">Spd</div><div class="v">${u.speed}</div></div>
-      <div class="su-stat"><div class="k">Cost</div><div class="v">${u.currentSupplyValue}</div></div>
-      <div class="su-stat"><div class="k">Mdl</div><div class="v">${al(u)}/${u.modelIds.length}</div></div>
-      <div class="su-stat"><div class="k">Arm</div><div class="v">${def.armorSave ?? "—"}+</div></div>
-      <div class="su-stat"><div class="k">Tgh</div><div class="v">${def.toughness ?? "—"}</div></div>
-      <div class="su-stat"><div class="k">Loc</div><div class="v">${tc(u.status.location)}</div></div>
+      <div class="su-stat"><div class="k">HP</div><div class="v">${ch.health}/${ch.maxHealth}</div></div>
+      <div class="su-stat"><div class="k">Move</div><div class="v">${ch.move}"</div></div>
+      <div class="su-stat"><div class="k">Rdy</div><div class="v">${tc(ch.readiness)}</div></div>
+      <div class="su-stat"><div class="k">Cond</div><div class="v" style="font-size:10px">${conditionText(ch) || "—"}</div></div>
+      <div class="su-stat"><div class="k">Scr</div><div class="v" style="font-size:10px">${ch.securingObjectiveId ?? "—"}</div></div>
     </div>
-    ${wpnHtml(u.rangedWeapons, "Ranged")}
-    ${wpnHtml(u.meleeWeapons, "Melee")}`;
-}
-
-function descCard(card) {
-  const mods = card.effect?.modifiers ?? [];
-  const parts = mods.map(m => {
-    if (m.key === "unit.speed") return `+${m.value} Speed`;
-    if (m.key === "weapon.hitTarget") return m.value < 0 ? `+${Math.abs(m.value)} Hit` : `-${m.value} Hit`;
-    if (m.key === "weapon.shotsPerModel" || m.key === "weapon.attacksPerModel") return `+${m.value} Atk`;
-    return `${m.key} ${m.value > 0 ? "+" : ""}${m.value}`;
-  });
-  const dur = card.effect?.duration;
-  let dt = "";
-  if (dur?.type === "phase_starts") dt = `til ${tc(dur.phase)}`;
-  else if (dur?.type === "events") dt = "next attack";
-  return { effect: parts.join(", ") || "—", dur: dt };
-}
-
-function renderCards(state, cardBtns) {
-  const el = document.getElementById("tacticalCards");
-  if (!el) return;
-  el.innerHTML = "";
-  const hand = state.players.playerA.hand ?? [];
-  if (!hand.length) { el.innerHTML = '<div class="d-empty">No cards</div>'; return; }
-  for (const entry of hand) {
-    const card = getTacticalCard(entry.cardId);
-    const d = descCard(card);
-    const playable = state.phase === "battle" && state.activePlayer === "playerA";
-    const div = document.createElement("div");
-    div.className = `tc-card ${playable ? "playable" : "inactive"}`;
-    div.innerHTML = `<div class="tc-name">${card.name} <span class="badge ${playable ? "good" : ""}">${tc(card.phase)}</span></div><div class="tc-effect">${d.effect}</div><div class="tc-meta">${d.dur}</div>`;
-    const btn = cardBtns.find(b => b.textContent?.includes(card.name));
-    if (btn) { btn.classList.add("btn", "secondary"); div.appendChild(btn); }
-    el.appendChild(div);
-  }
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-top:6px">Attacks</div>
+    ${attackRows}`;
 }
 
 function renderLog(state) {
   const el = document.getElementById("logPanel");
   if (!el) return;
   el.innerHTML = "";
-  for (const e of state.log) {
+  const entries = [...state.log].reverse().slice(0, 30);
+  for (const e of entries) {
     const d = document.createElement("div");
-    d.className = `log-entry ${e.type === "combat" ? "combat" : ""}`;
+    d.className = `log-entry ${e.type === "combat" ? "combat" : e.type === "score" ? "score" : ""}`;
     d.innerHTML = `<div class="meta">R${e.round}</div><div>${e.text}</div>`;
     el.appendChild(d);
   }
