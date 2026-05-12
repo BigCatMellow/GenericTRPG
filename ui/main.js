@@ -125,9 +125,24 @@ function getModeText() {
     const movePart = c.movementUsed ? "Move✓" : "Move";
     const actPart = c.actionUsed ? "Act✓" : "Act";
     if (uiState.mode === "move") return `Move ${c.name} — click destination (max ${c.move}").${progress}`;
-    if (uiState.mode === "run") return `Run ${c.name} — click destination (max 9", becomes Spent).${progress}`;
-    if (uiState.mode === "attack") return `Attack with ${c.name} (${uiState.pendingAttackKey}) — click an enemy.${progress}`;
-    if (uiState.mode === "class_ability") return `${c.name} class ability (${uiState.pendingAbilityId}) — click target.${progress}`;
+    if (uiState.mode === "run") return `Run ${c.name} — click destination (max 9", → Spent, no Action).${progress}`;
+    if (uiState.mode === "attack") {
+      const atk = c.attacks?.[uiState.pendingAttackKey];
+      let desc = atk ? `${atk.attackType} · ${atk.damage} dmg` : uiState.pendingAttackKey;
+      if (atk?.type === "ranged" || atk?.type === "magic") desc += ` · ${atk.range ?? 8}" range`;
+      if (atk?.appliesPinned) desc += " · applies Pinned on hit";
+      if (atk?.appliesExposed) desc += " · applies Exposed on hit";
+      if (atk?.oneCategoryHarder) desc += " · one step harder to hit";
+      if (atk?.bonusDmgIfExposedOrSpent) desc += " · +1 dmg vs Exposed/Spent";
+      return `${c.name}: ${atk?.name ?? "Attack"} (${desc}) — click an enemy.${progress}`;
+    }
+    if (uiState.mode === "class_ability") {
+      const descs = {
+        rally: "Rally: remove Pinned/Exposed from friendly, Spent→Committed, may grant Guarded.",
+        disrupt: "Disrupt: roll 1d6, 4+ → target Exposed + 1 dmg (3+ if already pressured). Mage → Committed."
+      };
+      return `${c.name}: ${descs[uiState.pendingAbilityId] ?? uiState.pendingAbilityId} — click target.${progress}`;
+    }
     return `${c.name} activating. ${movePart} · ${actPart}.${progress}`;
   }
 
@@ -283,10 +298,17 @@ function buildActionButtons() {
     // ATTACKS
     if (ch.attacks) {
       for (const [key, atk] of Object.entries(ch.attacks)) {
+        const parts = [`${atk.attackType} · ${atk.damage} dmg`];
+        if (atk.type === "ranged" || atk.type === "magic") parts.push(`range ${atk.range ?? 8}"`);
+        if (atk.appliesPinned) parts.push("→ Pinned on hit");
+        if (atk.appliesExposed) parts.push("→ Exposed on hit");
+        if (atk.oneCategoryHarder) parts.push("one step harder");
+        if (atk.bonusDmgIfExposedOrSpent) parts.push("+1 dmg vs Exposed/Spent");
+        const tip = `${atk.name}: ${parts.join(" · ")}`;
         buttons.unshift(actionButton(atk.name, "warn", () => {
           beginAttackInteraction(uiState, ch.id, key);
           rerender();
-        }));
+        }, false, tip));
       }
     }
 
@@ -295,13 +317,13 @@ function buildActionButtons() {
       buttons.push(actionButton("Rally", "primary", () => {
         beginClassAbilityInteraction(uiState, ch.id, "rally");
         rerender();
-      }));
+      }, false, "Rally (6\"): remove Pinned/Exposed from friendly; Spent→Committed; if changed, target becomes Guarded."));
     }
     if (ch.classId === "mage") {
       buttons.push(actionButton("Disrupt", "warn", () => {
         beginClassAbilityInteraction(uiState, ch.id, "disrupt");
         rerender();
-      }));
+      }, false, "Disrupt (8\"): roll 1d6, 4+ (or 3+ if target pressured): Exposed + 1 dmg; already Exposed → also Pinned. Mage → Committed."));
     }
   }
 
