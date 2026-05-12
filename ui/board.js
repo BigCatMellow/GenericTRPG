@@ -29,13 +29,13 @@ function addTerrain(svg, terrain) {
       x: t.rect.minX, y: t.rect.minY,
       width: t.rect.maxX - t.rect.minX,
       height: t.rect.maxY - t.rect.minY,
+      rx: 0.15, ry: 0.15,
       class: cls
     }));
-    // Terrain label
     const tx = (t.rect.minX + t.rect.maxX) / 2;
     const ty = (t.rect.minY + t.rect.maxY) / 2;
     const tl = el("text", { x: tx, y: ty, class: "terrain-label" });
-    tl.textContent = (t.traits?.[0] ?? t.kind ?? "")[0]?.toUpperCase() ?? "";
+    tl.textContent = t.label ?? (t.traits?.[0] ?? t.kind ?? "")[0]?.toUpperCase() ?? "";
     svg.appendChild(tl);
   }
 }

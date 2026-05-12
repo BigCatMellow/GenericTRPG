@@ -1,4 +1,3 @@
-// v0.12 Main UI controller
 import { createInitialGameState } from "../engine/state.js";
 import { beginGame } from "../engine/phases.js";
 import { dispatch as engineDispatch } from "../engine/reducer.js";
@@ -13,20 +12,58 @@ import { performBotTurn } from "../ai/bot.js";
 import { screenToBoardPoint } from "./board.js";
 import { snapPointToGrid } from "../engine/geometry.js";
 import { hasCondition } from "../engine/conditions.js";
+import { playBattle, buildSnapshotFromCombatResult } from "./battle_screen.js";
+
+const FACTION_LABELS = { playerA: "Crown Levy", playerB: "Border Reavers" };
 
 function createStore(initialState) {
   let state = initialState;
   const listeners = [];
+  let battleHandler = null;
+
+  async function dispatch(action) {
+    // Capture pre-state for ATTACK so the battle screen has accurate "before" data
+    let preSnap = null;
+    if (action.type === "ATTACK") {
+      const cs = state.characters;
+      const a = cs[action.payload.charId];
+      const t = cs[action.payload.targetId];
+      if (a && t) {
+        preSnap = {
+          attacker: structuredClone(a),
+          target: structuredClone(t),
+          attackKey: action.payload.attackKey
+        };
+      }
+    }
+    const result = engineDispatch(state, action);
+    if (result.ok) {
+      state = result.state;
+      listeners.forEach(fn => fn(state, result.events ?? []));
+      if (preSnap && result.combatResult && battleHandler) {
+        const targetAfter = state.characters[preSnap.target.id];
+        const attackDef = preSnap.attacker.attacks?.[preSnap.attackKey];
+        if (attackDef && targetAfter) {
+          const snap = buildSnapshotFromCombatResult({
+            combatResult: result.combatResult,
+            attackerBefore: preSnap.attacker,
+            targetBefore: preSnap.target,
+            targetAfter,
+            attackDef,
+            attackName: attackDef.name,
+            factionLabels: FACTION_LABELS
+          });
+          await battleHandler(snap);
+        }
+      }
+    }
+    return result;
+  }
+
   return {
     getState() { return state; },
-    dispatch(action) {
-      const result = engineDispatch(state, action);
-      if (result.ok) {
-        state = result.state;
-        listeners.forEach(fn => fn(state, result.events ?? []));
-      }
-      return result;
-    },
+    dispatch,
+    setBattleHandler(fn) { battleHandler = fn; },
     replaceState(next) {
       state = next;
       listeners.forEach(fn => fn(state, []));
@@ -379,7 +416,7 @@ function handleBoardClick(point) {
   }
 }
 
-function handleCharClick(charId) {
+async function handleCharClick(charId) {
   if (uiState.pendingPass) {
     uiState.pendingPass = false;
     rerender();
@@ -390,7 +427,7 @@ function handleCharClick(charId) {
   if (!clicked) return;
 
   if (uiState.mode === "attack" && sel && clicked.owner !== "playerA") {
-    const result = store.dispatch({
+    const result = await store.dispatch({
       type: "ATTACK",
       payload: { playerId: "playerA", charId: sel.id, targetId: clicked.id, attackKey: uiState.pendingAttackKey }
     });
@@ -402,7 +439,7 @@ function handleCharClick(charId) {
   }
 
   if (uiState.mode === "class_ability" && sel) {
-    const result = store.dispatch({
+    const result = await store.dispatch({
       type: "CLASS_ABILITY",
       payload: { playerId: "playerA", charId: sel.id, abilityId: uiState.pendingAbilityId, targetId: clicked.id }
     });
@@ -586,6 +623,14 @@ function wireKeyboardShortcuts() {
 function init() {
   store = createStore(buildInitialState());
   bindInputHandlers(store, controller());
+  store.setBattleHandler(async (snap) => {
+    const wasLocked = uiState.locked;
+    uiState.locked = true;
+    rerender();
+    await playBattle(snap);
+    uiState.locked = wasLocked;
+    rerender();
+  });
   const gridBtn = document.getElementById("gridModeBtn");
   if (gridBtn) gridBtn.textContent = "Grid: On";
   uiState.lastSeenLogCount = store.getState().log.length;

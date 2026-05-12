@@ -353,17 +353,17 @@ export async function performBotTurn(store, pid) {
   // Mid-activation: continue with active character
   if (state.activatingCharacterId) {
     const ch = state.characters[state.activatingCharacterId];
-    if (!ch) return store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: state.activatingCharacterId } });
+    if (!ch) return await store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: state.activatingCharacterId } });
     const ctx = assess(state, pid);
     const actions = planActivation(state, pid, ch, ctx);
     let last = { ok: true, state };
     for (const act of actions) {
       const current = store.getState();
       if (current.activatingCharacterId !== ch.id && act.type !== "HOLD") continue;
-      last = store.dispatch(act);
+      last = await store.dispatch(act);
       if (!last.ok) {
         if (store.getState().activatingCharacterId) {
-          store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: ch.id } });
+          await store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: ch.id } });
         }
         return last;
       }
@@ -375,20 +375,20 @@ export async function performBotTurn(store, pid) {
   const ctx = assess(state, pid);
   const next = pickNextCharacter(state, pid, ctx);
   if (!next) {
-    return store.dispatch({ type: "PASS_ROUND", payload: { playerId: pid } });
+    return await store.dispatch({ type: "PASS_ROUND", payload: { playerId: pid } });
   }
 
   const actions = planActivation(state, pid, next, ctx);
   if (!actions || !actions.length) {
-    return store.dispatch({ type: "HOLD", payload: { playerId: pid, charId: next.id } });
+    return await store.dispatch({ type: "HOLD", payload: { playerId: pid, charId: next.id } });
   }
 
   let last = { ok: true, state };
   for (const act of actions) {
-    last = store.dispatch(act);
+    last = await store.dispatch(act);
     if (!last.ok) {
       if (store.getState().activatingCharacterId) {
-        store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: next.id } });
+        await store.dispatch({ type: "END_ACTIVATION", payload: { playerId: pid, charId: next.id } });
       }
       return last;
     }

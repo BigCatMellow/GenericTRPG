@@ -24,11 +24,11 @@ const STARTING_POSITIONS_B = [
 
 function createTerrain() {
   return [
-    { id: "t1", kind: "blocking", impassable: true, traits: ["blocking"], rect: { minX: 10, minY: 10, maxX: 14, maxY: 14 } },
-    { id: "t2", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 3, minY: 8, maxX: 7, maxY: 11 } },
-    { id: "t3", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 17, minY: 13, maxX: 21, maxY: 16 } },
-    { id: "t4", kind: "difficult", impassable: false, traits: ["difficult"], rect: { minX: 5, minY: 14, maxX: 9, maxY: 18 } },
-    { id: "t5", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 15, minY: 6, maxX: 19, maxY: 9 } }
+    { id: "t1", kind: "blocking", impassable: true, traits: ["blocking"], rect: { minX: 10, minY: 10, maxX: 14, maxY: 14 }, label: "RUIN" },
+    { id: "t2", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 3, minY: 8, maxX: 7, maxY: 11 }, label: "WOODS" },
+    { id: "t3", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 17, minY: 13, maxX: 21, maxY: 16 }, label: "HEDGE" },
+    { id: "t4", kind: "difficult", impassable: false, traits: ["difficult"], rect: { minX: 5, minY: 14, maxX: 9, maxY: 18 }, label: "MUD" },
+    { id: "t5", kind: "cover", impassable: false, traits: ["cover"], rect: { minX: 15, minY: 6, maxX: 19, maxY: 9 }, label: "GROVE" }
   ];
 }
 
